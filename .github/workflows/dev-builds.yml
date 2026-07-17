@@ -13,10 +13,10 @@ jobs:
       dev_suffix: ${{ steps.changelog.outputs.dev_suffix }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "lts/*"
           cache: npm
@@ -67,11 +67,11 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Java
         id: setup-java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -127,7 +127,7 @@ jobs:
           echo "apk_dir=$APK_DIR" >> "$GITHUB_OUTPUT"
 
       - name: Upload APK artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: urv-dev
           retention-days: 14
@@ -151,13 +151,13 @@ jobs:
       GH_REPO: ${{ github.repository }}
     steps:
       - name: Download dev APK artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: urv-dev
           path: release-artifacts
 
       - name: Download dev release notes
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dev-release-notes
           path: .
