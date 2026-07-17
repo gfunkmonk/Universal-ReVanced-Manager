@@ -201,6 +201,30 @@
 - Adjusted the supported versions dialog so it is not become too wide when opened from patch search https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/559
 - Standardized installer log filename and timestamp formatting with other exported logs https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/558
 - Improved dialog text consistency and added clearer save confirmations for patched and merged APKs https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/555 https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/553 https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/552
+- Plugin notifications no longer remain after opening the Download or Patcher Runtimes settings https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/556
+- Moved “Merged APK filename format” under “Export filename format” in Advanced system settings https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/551
+- Added a Done button to the patcher screen after patching completes https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/580
+- Added Shevery support for Shizuku-based installs, including detection, manager launching, installer icons, and updated installer labels https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/585
+- Added suggested version dropdowns to app search results on the `Select an app` screen https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/586
+- Added split ordering options to the split APK merge selection screen https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/582
+- Added the ability to install APKs downloaded through plugins from the Downloads screen https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/541
+- Corrected singular and plural wording in patch bundle import progress https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/590
+- Made patch bundle update progress counts use consistent `out of` wording https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/591
+- Added a minimal patch selection view preset with controls for version tags and patch option previews https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/274
+- Added consistent progress notification metadata and Android 16 progress styling for cutout ring support https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/394
+- Made bundle import and update progress banners collapse independently and remember each state https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/588
+- Added separate remembered folders for file selection and export workflows in both the custom and built-in Android file pickers https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/543
+- Added an `Install base & mount` option that installs base and split APKs through root before mounting the patched APK https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/542
+- Added per-profile installer selection and automatic installation to Patch Profiles https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/583
+- Added a Patcher Engine option to skip signing and keep patched APKs unsigned for saving or installation
+- Automatically enabled manager pre-release updates when running a pre-release build https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/593
+- Bumped Morphe Patcher to `1.6.0`
+- Added APK version codes to app details, supported-version displays, searches, and Morphe patch compatibility checks https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/594
+- Added an option to choose which split APKs are merged before patching https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/592
+- Automatically remove unavailable patches and their saved options from saved selections, and show a toast indicating which patches were removed https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/595
+- Added an optional root-only LSPosed tab with support for LSPosed, Vector, and compatible builds, including local and GitHub module management, update checks, manager and settings shortcuts, and customizable module actions https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/596 https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/598
+- Added Signature metadata injector & cloner tool under APK signature tools
+- Improved the Split installer tools log, making it consistent with the Signaute metadata injector & cloner tools log design
 
 
 # Bug fixes
@@ -350,11 +374,15 @@
 - Fixed rooted mounted apps sometimes starting without patches after reboot https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/578
 - Fixed patcher and split APK merger progress bars appearing partially filled before progress begins https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/569
 - Fixed issues with the split APK merger during corrupting and breaking some APKs
+- Fixed bundle update labels not appearing when a saved app's patch bundle was imported again through settings https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/581
+- Fixed bundle recommendations continuing to use the first selected bundle's patches after switching bundles while preserving custom patch selections https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/579
+- Fixed patch bundle update and import progress bars showing a filled marker at the end before completion https://github.com/Jman-Github/Universal-ReVanced-Manager/issues/589
 
 
 # Refactors
 
 - Migrated URV’s internal source namespace from `app.revanced.manager` to `app.urv.manager` across the app, API, and runtime modules
+- Reorganized navigation, tab, and action-button settings under Appearance & UI, and improved search to expand and highlight nested settings correctly
 
 
 # CI

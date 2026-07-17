@@ -1,6 +1,7 @@
 package app.urv.manager.ui.screen
 
 import android.os.Build
+import android.net.Uri
 import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -27,15 +28,20 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ExitToApp
 import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.outlined.Cancel
+import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.outlined.ArrowDropDown
 import androidx.compose.material.icons.outlined.FileDownload
+import androidx.compose.material.icons.outlined.Layers
 import androidx.compose.material.icons.outlined.PostAdd
 import androidx.compose.material.icons.outlined.Save
 import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.BottomAppBar
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.FilledTonalButton
@@ -54,6 +60,7 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.livedata.observeAsState
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -76,8 +83,12 @@ import app.urv.manager.ui.component.ConfirmDialog
 import app.urv.manager.ui.component.InterceptBackHandler
 import app.urv.manager.ui.component.InstallerStatusDialog
 import app.urv.manager.ui.component.ProgressPercentageBadge
+import app.urv.manager.ui.component.TransparentLoadingDialog
 import app.urv.manager.ui.component.haptics.HapticExtendedFloatingActionButton
+import app.urv.manager.ui.component.haptics.HapticFloatingActionButton
 import app.urv.manager.ui.component.patches.PathSelectorDialog
+import app.urv.manager.ui.component.RememberedCreateDocument
+import app.urv.manager.ui.component.toPickerDirectoryUri
 import app.urv.manager.ui.component.patcher.InstallerPickerDialog
 import app.urv.manager.ui.component.patcher.LegacyAndroidMemoryWarning
 import app.urv.manager.ui.component.patcher.PatcherMemoryUsageCard
@@ -100,6 +111,9 @@ import app.urv.manager.util.toast
 import org.koin.compose.koinInject
 import java.nio.file.Files
 import java.nio.file.Path
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import app.urv.manager.ui.component.CenteredDialogTitle
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -115,11 +129,17 @@ fun PatcherScreen(
     val prefs: PreferencesManager = koinInject()
     val exportFormat by prefs.patchedAppExportFormat.getAsState()
     val useCustomFilePicker by prefs.useCustomFilePicker.getAsState()
+    val patchedApkExportDirectory by prefs.patchedApkExportLastDirectory.getAsState()
+    val patcherLogExportDirectory by prefs.patcherLogExportLastDirectory.getAsState()
+    val splitMergeSortMode by prefs.splitMergeModuleSortMode.getAsState()
+    val pickerScope = rememberCoroutineScope()
     val autoCollapsePatcherSteps by prefs.autoCollapsePatcherSteps.getAsState()
     val showPatcherMemoryUsageGraph by prefs.showPatcherMemoryUsageGraph.getAsState()
     val autoExpandRunningSteps by prefs.autoExpandRunningSteps.getAsState()
     val autoExpandRunningStepsExclusive by prefs.autoExpandRunningStepsExclusive.getAsState()
     val chooseInstallerPerInstall by prefs.chooseInstallerPerInstall.getAsState()
+    val primaryInstallerValue by prefs.installerPrimary.getAsState()
+    val fallbackInstallerValue by prefs.installerFallback.getAsState()
     val continueOnPatchError by prefs.continueOnPatchError.getAsState()
     val useExclusiveAutoExpand = autoExpandRunningSteps && autoExpandRunningStepsExclusive
     val savedAppsEnabled by prefs.enableSavedApps.getAsState()
@@ -138,8 +158,40 @@ fun PatcherScreen(
 
     val patcherSucceeded by viewModel.patcherSucceeded.observeAsState(null)
     val isPatchingActive by viewModel.isPatchingActive.observeAsState(false)
+
+    LaunchedEffect(patcherSucceeded) {
+        if (patcherSucceeded == true) viewModel.maybeAutoInstallProfile()
+    }
     val isMounting = viewModel.activeInstallType == InstallType.MOUNT
     val canInstall by remember { derivedStateOf { patcherSucceeded == true && (viewModel.installedPackageName != null || !viewModel.isInstalling) } }
+    val primaryInstallerIsMount = remember(primaryInstallerValue) {
+        installerManager.parseToken(primaryInstallerValue) is InstallerManager.Token.AutoSaved
+    }
+    val fallbackInstallerIsMount = remember(fallbackInstallerValue) {
+        installerManager.parseToken(fallbackInstallerValue) is InstallerManager.Token.AutoSaved
+    }
+    var mountInstallerAvailable by remember { mutableStateOf(false) }
+    LaunchedEffect(chooseInstallerPerInstall, primaryInstallerIsMount, fallbackInstallerIsMount) {
+        mountInstallerAvailable = if (
+            !chooseInstallerPerInstall && (primaryInstallerIsMount || fallbackInstallerIsMount)
+        ) {
+            withContext(Dispatchers.IO) {
+                installerManager.describeEntry(
+                    InstallerManager.Token.AutoSaved,
+                    InstallerManager.InstallTarget.PATCHER
+                )?.availability?.available == true
+            }
+        } else {
+            false
+        }
+    }
+    val showMountFallbackMenu =
+        !chooseInstallerPerInstall &&
+            viewModel.installedPackageName == null &&
+            !viewModel.basePackageInstalled &&
+            fallbackInstallerIsMount &&
+            !primaryInstallerIsMount &&
+            mountInstallerAvailable
     var showDismissConfirmationDialog by rememberSaveable { mutableStateOf(false) }
     var showInstallInProgressDialog by rememberSaveable { mutableStateOf(false) }
     var showSavePatchedAppDialog by rememberSaveable { mutableStateOf(false) }
@@ -149,6 +201,7 @@ fun PatcherScreen(
     var showLogExportPicker by rememberSaveable { mutableStateOf(false) }
     var logExportInProgress by rememberSaveable { mutableStateOf(false) }
     var showInstallerPicker by rememberSaveable { mutableStateOf(false) }
+    var showInstallDropdown by rememberSaveable { mutableStateOf(false) }
     var pendingLogExportFileName by rememberSaveable { mutableStateOf<String?>(null) }
     val fs: Filesystem = koinInject()
     val storageRoots = remember { fs.storageRoots() }
@@ -165,14 +218,28 @@ fun PatcherScreen(
             }
         }
     val exportDocumentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.CreateDocument("application/vnd.android.package-archive")
+        contract = RememberedCreateDocument("application/vnd.android.package-archive") {
+            patchedApkExportDirectory.takeIf(String::isNotBlank)?.let(Uri::parse)
+        }
     ) { uri ->
+        uri?.let {
+            pickerScope.launch {
+                prefs.patchedApkExportLastDirectory.update(it.toPickerDirectoryUri().toString())
+            }
+        }
         viewModel.export(uri)
         showExportPicker = false
     }
     val logExportDocumentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.CreateDocument("text/plain")
+        contract = RememberedCreateDocument("text/plain") {
+            patcherLogExportDirectory.takeIf(String::isNotBlank)?.let(Uri::parse)
+        }
     ) { uri ->
+        uri?.let {
+            pickerScope.launch {
+                prefs.patcherLogExportLastDirectory.update(it.toPickerDirectoryUri().toString())
+            }
+        }
         viewModel.exportLogsToUri(context, uri)
         showLogExportPicker = false
         pendingLogExportFileName = null
@@ -373,7 +440,8 @@ fun PatcherScreen(
             confirmButtonText = stringResource(R.string.save),
             onConfirm = { directory ->
                 exportFileDialogState = ExportApkDialogState(directory, exportFileName)
-            }
+            },
+            lastDirectoryPreference = prefs.patchedApkExportLastDirectory
         )
     }
     if (showLogExportPicker && useCustomFilePicker) {
@@ -394,7 +462,8 @@ fun PatcherScreen(
                     directory,
                     pendingLogExportFileName ?: FilenameUtils.timestampedLogFileName("patcher")
                 )
-            }
+            },
+            lastDirectoryPreference = prefs.patcherLogExportLastDirectory
         )
     }
     LaunchedEffect(showExportPicker, useCustomFilePicker, exportFileName) {
@@ -681,6 +750,74 @@ fun PatcherScreen(
         )
     }
 
+    if (viewModel.isPreparingSplitSelection) {
+        val downloadProgress = viewModel.prePatchDownloadProgress
+        val downloadFraction = downloadProgress?.fraction
+        val message = when {
+            downloadProgress == null ->
+                stringResource(R.string.patcher_preparing_split_selection)
+            downloadFraction != null ->
+                stringResource(
+                    R.string.patcher_downloading_apk_progress,
+                    (downloadFraction * 100).toInt()
+                )
+            else -> stringResource(R.string.patcher_downloading_apk)
+        }
+        TransparentLoadingDialog(
+            message = message,
+            cancelButtonText = stringResource(R.string.cancel),
+            onCancel = {
+                viewModel.cancelSplitSelectionPreparation()
+                onPageBack()
+            },
+            progress = downloadFraction
+        )
+    }
+
+    viewModel.splitSelectionPreparationError?.let { message ->
+        AlertDialog(
+            onDismissRequest = {},
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        viewModel.dismissSplitSelectionPreparationError()
+                        onPageBack()
+                    }
+                ) {
+                    Text(stringResource(R.string.ok))
+                }
+            },
+            title = {
+                CenteredDialogTitle(
+                    stringResource(R.string.patcher_prepare_input_failed)
+                )
+            },
+            text = { Text(message) }
+        )
+    }
+
+    viewModel.splitSelectionDialog?.let { state ->
+        SplitMergeSelectionDialog(
+            selection = state.inspection,
+            initialModules = state.initialModules,
+            initialStripNativeLibs = state.initialStripNativeLibs,
+            initialPresetKey = "all",
+            initialSortMode = SplitMergeModuleSortMode.fromStorage(splitMergeSortMode),
+            confirmTextRes = R.string.continue_,
+            onDismissRequest = {
+                viewModel.cancelSplitSelectionPreparation()
+                onPageBack()
+            },
+            onFilterSelectionChanged = { _, _, _, _ -> },
+            onSortModeChanged = { mode ->
+                pickerScope.launch {
+                    prefs.splitMergeModuleSortMode.update(mode.storageValue)
+                }
+            },
+            onConfirm = viewModel::confirmSplitSelection
+        )
+    }
+
     viewModel.missingPatchWarning?.let { state ->
         AlertDialog(
             onDismissRequest = {},
@@ -885,38 +1022,110 @@ fun PatcherScreen(
                 ) {
                     Icon(Icons.Outlined.PostAdd, stringResource(id = R.string.save_logs))
                 }
+                IconButton(
+                    onClick = ::onPageBackToDashboard,
+                    enabled = canInstall
+                ) {
+                    Icon(Icons.Outlined.Check, stringResource(R.string.done))
+                }
                 },
                 floatingActionButton = {
                     AnimatedVisibility(visible = canInstall) {
-                        HapticExtendedFloatingActionButton(
-                            text = {
-                                Text(
-                                    stringResource(if (viewModel.installedPackageName == null) R.string.install_app else R.string.open_app)
-                                )
-                            },
-                            icon = {
-                                viewModel.installedPackageName?.let {
-                                    Icon(
-                                        Icons.AutoMirrored.Outlined.OpenInNew,
-                                        stringResource(R.string.open_app)
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    HapticExtendedFloatingActionButton(
+                                        text = {
+                                            Text(
+                                                stringResource(
+                                                    when {
+                                                        viewModel.installedPackageName != null -> R.string.open_app
+                                                        !chooseInstallerPerInstall && primaryInstallerIsMount &&
+                                                            mountInstallerAvailable && !viewModel.basePackageInstalled ->
+                                                            R.string.install_base_and_mount
+                                                        else -> R.string.install_app
+                                                    }
+                                                )
+                                            )
+                                        },
+                                        icon = {
+                                            when {
+                                                viewModel.installedPackageName != null -> Icon(
+                                                    Icons.AutoMirrored.Outlined.OpenInNew,
+                                                    stringResource(R.string.open_app)
+                                                )
+                                                !chooseInstallerPerInstall && primaryInstallerIsMount &&
+                                                    mountInstallerAvailable && !viewModel.basePackageInstalled -> Icon(
+                                                    Icons.Outlined.Layers,
+                                                    stringResource(R.string.install_base_and_mount)
+                                                )
+                                                else -> Icon(
+                                                    Icons.Outlined.FileDownload,
+                                                    stringResource(R.string.install_app)
+                                                )
+                                            }
+                                        },
+                                        onClick = {
+                                            when {
+                                                viewModel.installedPackageName != null -> viewModel.open()
+                                                viewModel.hasProfileInstallerPreference -> viewModel.install()
+                                                chooseInstallerPerInstall -> showInstallerPicker = true
+                                                else -> viewModel.install()
+                                            }
+                                        },
+                                        shape = if (showMountFallbackMenu) {
+                                            RoundedCornerShape(
+                                                topStart = 16.dp,
+                                                bottomStart = 16.dp,
+                                                topEnd = 0.dp,
+                                                bottomEnd = 0.dp
+                                            )
+                                        } else {
+                                            RoundedCornerShape(16.dp)
+                                        }
                                     )
-                                } ?: Icon(
-                                    Icons.Outlined.FileDownload,
-                                    stringResource(R.string.install_app)
-                                )
-                            },
-                            onClick = {
-                                if (viewModel.installedPackageName == null) {
-                                    if (chooseInstallerPerInstall) {
-                                        showInstallerPicker = true
-                                    } else {
-                                        viewModel.install()
+                                    if (showMountFallbackMenu) {
+                                        HapticFloatingActionButton(
+                                            onClick = { showInstallDropdown = true },
+                                            modifier = Modifier.size(56.dp),
+                                            shape = RoundedCornerShape(
+                                                topStart = 0.dp,
+                                                bottomStart = 0.dp,
+                                                topEnd = 16.dp,
+                                                bottomEnd = 16.dp
+                                            )
+                                        ) {
+                                            Icon(
+                                                Icons.Outlined.ArrowDropDown,
+                                                contentDescription = stringResource(R.string.install_base_and_mount),
+                                                modifier = Modifier.size(30.dp)
+                                            )
+                                        }
                                     }
-                                } else {
-                                    viewModel.open()
+                                }
+                                DropdownMenu(
+                                    expanded = showInstallDropdown && showMountFallbackMenu,
+                                    onDismissRequest = { showInstallDropdown = false }
+                                ) {
+                                    DropdownMenuItem(
+                                        text = { Text(stringResource(R.string.install_base_and_mount)) },
+                                        leadingIcon = {
+                                            Icon(
+                                                Icons.Outlined.Layers,
+                                                contentDescription = null
+                                            )
+                                        },
+                                        onClick = {
+                                            showInstallDropdown = false
+                                            viewModel.installWithToken(InstallerManager.Token.AutoSaved)
+                                        }
+                                    )
                                 }
                             }
-                        )
+                        }
                     }
                 }
             )

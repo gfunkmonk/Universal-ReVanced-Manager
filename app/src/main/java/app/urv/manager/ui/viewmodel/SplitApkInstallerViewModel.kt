@@ -25,22 +25,19 @@ import app.universal.revanced.manager.R
 import java.io.File
 import java.io.FileNotFoundException
 import java.io.IOException
-import java.io.InputStreamReader
-import java.io.OutputStreamWriter
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.TimeUnit
 import java.util.zip.ZipFile
 import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -59,21 +56,11 @@ class SplitApkInstallerViewModel(
     val state = stateFlow.asStateFlow()
     private val cleanupLock = Any()
     private val cancelCleanupActions = mutableListOf<() -> Unit>()
-    private val rootProcessLock = Any()
-    private val rootSessionLock = Any()
-    private val activeRootProcesses = mutableSetOf<Process>()
-    private var rootShellSession: RootShellSession? = null
     private var availabilityRefreshJob: Job? = null
     private var installJob: Job? = null
 
     init {
         refreshAvailability()
-    }
-
-    override fun onCleared() {
-        closeRootShellSession()
-        killTrackedRootProcesses()
-        super.onCleared()
     }
 
     fun refreshAvailability(userInitiated: Boolean = false) {
@@ -137,7 +124,7 @@ class SplitApkInstallerViewModel(
         clearCancelCleanupActions()
         val job = viewModelScope.launch {
             val cacheUseToken = CacheCleanupGuard.begin()
-            clearLogs()
+            startLogSession()
             appendLog("Started split install (${mode.name.lowercase(Locale.ROOT)})")
             inputDisplayName?.takeIf { it.isNotBlank() }?.let { appendLog("Input: $it") }
             val preparingMessage = app.getString(R.string.split_installer_preparing)
@@ -242,7 +229,7 @@ class SplitApkInstallerViewModel(
                 app.toast(app.getString(R.string.split_installer_error_toast))
             } finally {
                 if (!completedSuccessfully) {
-                    withContext(Dispatchers.IO) {
+                    withContext(NonCancellable + Dispatchers.IO) {
                         runCancelCleanupActions()
                     }
                 } else {
@@ -251,10 +238,10 @@ class SplitApkInstallerViewModel(
                 if (deleteInputAfterUse) {
                     inputFile?.let { runCatching { it.delete() } }
                 }
-                closeRootShellSession()
                 runCatching { workspace.deleteRecursively() }
                 refreshAvailability()
                 runCatching { cacheUseToken.close() }
+                stateFlow.update { it.copy(logComplete = true) }
             }
         }
         installJob = job
@@ -269,8 +256,16 @@ class SplitApkInstallerViewModel(
         val activeJob = installJob ?: return
         if (!activeJob.isActive) return
         appendLog("Cancellation requested by user")
-        closeRootShellSession()
-        killTrackedRootProcesses()
+        stateFlow.update {
+            it.copy(
+                inProgress = false,
+                activeMode = null,
+                statusMessage = null
+            )
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            runCancelCleanupActions()
+        }
         activeJob.cancel(CancellationException("Split install cancelled by user"))
     }
 
@@ -508,118 +503,12 @@ class SplitApkInstallerViewModel(
         }
     }
 
-    private suspend fun installWithRootPackageManager(apkFiles: List<File>) = withContext(Dispatchers.IO) {
-        val rootProbe = execRootCommand("id")
-        appendLog("Root shell probe: ${renderRootCommandResult(rootProbe)}")
-        if (!rootProbe.success) {
-            throw IOException(app.getString(R.string.split_installer_no_privileged_access))
-        }
-
-        val installerPackage = shellQuote(app.packageName)
-        val createCommands = listOf(
-            "pm install-create -r --install-location 0 -i $installerPackage",
-            "pm install-create -r -i $installerPackage",
-            "cmd package install-create -r --install-location 0 -i $installerPackage",
-            "cmd package install-create -r -i $installerPackage",
-            "pm install-create -r",
-            "cmd package install-create -r"
+    private suspend fun installWithRootPackageManager(apkFiles: List<File>) {
+        rootInstaller.installPackageFiles(
+            apkFiles = apkFiles,
+            onLog = ::appendLog,
+            registerCancelCleanup = ::registerCancelCleanupAction
         )
-
-        var sessionId: String? = null
-        var createFailureDetail = app.getString(R.string.split_installer_failed)
-        for ((attemptIndex, command) in createCommands.withIndex()) {
-            coroutineContext.ensureActive()
-            val createResult = execRootCommand(command)
-            val combinedOutput = combineRootCommandOutput(createResult)
-            val resolvedAttemptSessionId = parseSessionId(combinedOutput)
-            appendLog(
-                "Root install-create attempt ${attemptIndex + 1}: ${renderRootCommandResult(createResult)}, " +
-                    "session=${resolvedAttemptSessionId ?: "n/a"}"
-            )
-            if (createResult.success && resolvedAttemptSessionId != null) {
-                sessionId = resolvedAttemptSessionId
-                break
-            }
-            createFailureDetail = combinedOutput.ifBlank { createFailureDetail }
-        }
-
-        val resolvedSessionId = sessionId ?: throw IOException(
-            buildString {
-                append("Unable to create root install session.")
-                if (createFailureDetail.isNotBlank()) {
-                    append(" ")
-                    append(createFailureDetail)
-                }
-            }
-        )
-
-        registerCancelCleanupAction {
-            execRootCommandBestEffort("pm install-abandon $resolvedSessionId")
-            execRootCommandBestEffort("cmd package install-abandon $resolvedSessionId")
-        }
-
-        var committed = false
-        try {
-            for ((index, file) in apkFiles.withIndex()) {
-                coroutineContext.ensureActive()
-                val splitName = "$index.apk"
-                appendLog("Root install-write: session=$resolvedSessionId, split=$splitName, size=${file.length()}")
-                val writeCommands = listOf(
-                    "pm install-write -S ${file.length()} $resolvedSessionId ${shellQuote(splitName)} < ${shellQuote(file.absolutePath)}",
-                    "cmd package install-write -S ${file.length()} $resolvedSessionId ${shellQuote(splitName)} < ${shellQuote(file.absolutePath)}"
-                )
-                var writeSucceeded = false
-                var writeFailureDetail = app.getString(R.string.split_installer_failed)
-                for ((attemptIndex, command) in writeCommands.withIndex()) {
-                    coroutineContext.ensureActive()
-                    val writeResult = execRootCommand(command)
-                    val writeOutput = combineRootCommandOutput(writeResult)
-                    appendLog(
-                        "Root install-write attempt ${attemptIndex + 1}: ${renderRootCommandResult(writeResult)}"
-                    )
-                    val success = writeResult.success && !writeOutput.contains("Failure", ignoreCase = true)
-                    if (success) {
-                        writeSucceeded = true
-                        break
-                    }
-                    writeFailureDetail = writeOutput.ifBlank { writeFailureDetail }
-                }
-                if (!writeSucceeded) {
-                    throw IOException(writeFailureDetail.ifBlank { app.getString(R.string.split_installer_failed) })
-                }
-            }
-
-            val commitCommands = listOf(
-                "pm install-commit $resolvedSessionId",
-                "cmd package install-commit $resolvedSessionId"
-            )
-            var commitSucceeded = false
-            var commitFailureDetail = app.getString(R.string.split_installer_failed)
-            for ((attemptIndex, command) in commitCommands.withIndex()) {
-                coroutineContext.ensureActive()
-                val commitResult = execRootCommand(command)
-                val commitOutput = combineRootCommandOutput(commitResult)
-                appendLog(
-                    "Root install-commit attempt ${attemptIndex + 1}: ${renderRootCommandResult(commitResult)}"
-                )
-                val success = commitResult.success && !commitOutput.contains("Failure", ignoreCase = true)
-                if (success) {
-                    commitSucceeded = true
-                    break
-                }
-                commitFailureDetail = commitOutput.ifBlank { commitFailureDetail }
-            }
-            if (!commitSucceeded) {
-                throw IOException(commitFailureDetail.ifBlank { app.getString(R.string.split_installer_failed) })
-            }
-            appendLog("Root package manager install committed successfully (session $resolvedSessionId)")
-            committed = true
-        } finally {
-            if (!committed) {
-                runCatching { execRootCommand("pm install-abandon $resolvedSessionId") }
-                runCatching { execRootCommand("cmd package install-abandon $resolvedSessionId") }
-            }
-        }
     }
 
     private suspend fun prepareSplitApkFiles(
@@ -729,122 +618,6 @@ class SplitApkInstallerViewModel(
         return candidate.takeIf { PACKAGE_NAME_PATTERN.matches(it) }
     }
 
-    private fun shellQuote(value: String): String =
-        "'" + value.replace("'", "'\\''") + "'"
-
-    private suspend fun execRootCommand(command: String): RootShellCommandResult = withContext(Dispatchers.IO) {
-        coroutineScope {
-            try {
-                ensureRootShellSession().exec(command)
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Throwable) {
-                closeRootShellSession()
-                RootShellCommandResult(
-                    success = false,
-                    code = -1,
-                    stdout = "",
-                    stderr = error.message ?: error::class.java.simpleName
-                )
-            }
-        }
-    }
-
-    private fun combineRootCommandOutput(result: RootShellCommandResult): String =
-        listOf(result.stdout, result.stderr)
-            .map(String::trim)
-            .filter(String::isNotBlank)
-            .joinToString("\n")
-
-    private fun renderRootCommandResult(result: RootShellCommandResult): String {
-        val output = combineRootCommandOutput(result)
-        return "success=${result.success}, code=${result.code}, output=${output.ifBlank { "n/a" }}"
-    }
-
-    private fun execRootCommandBestEffort(command: String, timeoutMillis: Long = 2_000L) {
-        runCatching {
-            val session = synchronized(rootSessionLock) { rootShellSession }
-            if (session?.isAlive() == true) {
-                runCatching { session.execBlocking(command) }
-                    .onFailure {
-                        runCatching {
-                            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", command))
-                            runCatching { process.outputStream.close() }
-                            process.waitFor(timeoutMillis, TimeUnit.MILLISECONDS)
-                            runCatching { process.destroy() }
-                            runCatching { process.destroyForcibly() }
-                        }
-                    }
-            } else {
-                val process = Runtime.getRuntime().exec(arrayOf("su", "-c", command))
-                runCatching { process.outputStream.close() }
-                process.waitFor(timeoutMillis, TimeUnit.MILLISECONDS)
-                runCatching { process.destroy() }
-                runCatching { process.destroyForcibly() }
-            }
-        }
-    }
-
-    private fun ensureRootShellSession(): RootShellSession {
-        synchronized(rootSessionLock) {
-            rootShellSession?.takeIf { it.isAlive() }?.let { return it }
-            val process = Runtime.getRuntime().exec(arrayOf("su"))
-            trackRootProcess(process)
-            return RootShellSession(process).also { rootShellSession = it }
-        }
-    }
-
-    private fun closeRootShellSession() {
-        val session = synchronized(rootSessionLock) {
-            val current = rootShellSession
-            rootShellSession = null
-            current
-        } ?: return
-
-        val process = session.process
-        runCatching { session.close() }
-        untrackRootProcess(process)
-        runCatching { process.destroy() }
-        runCatching { process.destroyForcibly() }
-    }
-
-    private fun parseSessionId(output: String): String? {
-        val normalized = output.trim()
-        if (normalized.isEmpty()) return null
-        if (normalized.matches(Regex("^\\d+$"))) return normalized
-        val bracketed = SESSION_ID_PATTERN.find(normalized)?.groupValues?.getOrNull(1)
-        if (!bracketed.isNullOrBlank()) return bracketed
-        val explicit = Regex("session(?:\\s+id)?\\s*[:=]?\\s*(\\d+)", RegexOption.IGNORE_CASE)
-            .find(normalized)
-            ?.groupValues
-            ?.getOrNull(1)
-        return explicit?.takeIf { it.isNotBlank() }
-    }
-
-    private fun trackRootProcess(process: Process) {
-        synchronized(rootProcessLock) {
-            activeRootProcesses += process
-        }
-    }
-
-    private fun untrackRootProcess(process: Process) {
-        synchronized(rootProcessLock) {
-            activeRootProcesses -= process
-        }
-    }
-
-    private fun killTrackedRootProcesses() {
-        val processes = synchronized(rootProcessLock) {
-            val snapshot = activeRootProcesses.toList()
-            activeRootProcesses.clear()
-            snapshot
-        }
-        processes.forEach { process ->
-            runCatching { process.destroy() }
-            runCatching { process.destroyForcibly() }
-        }
-    }
-
     private fun registerCancelCleanupAction(action: () -> Unit) {
         synchronized(cleanupLock) {
             cancelCleanupActions += action
@@ -852,7 +625,6 @@ class SplitApkInstallerViewModel(
     }
 
     private fun runCancelCleanupActions() {
-        killTrackedRootProcesses()
         val actions = synchronized(cleanupLock) {
             val snapshot = cancelCleanupActions.toList()
             cancelCleanupActions.clear()
@@ -877,13 +649,25 @@ class SplitApkInstallerViewModel(
         if (trimmed.isEmpty()) return
         val timestamp = "%1\$tH:%1\$tM:%1\$tS".format(Date())
         stateFlow.update { current ->
-            current.copy(logEntries = current.logEntries + "[$timestamp] $trimmed")
+            current.copy(
+                logEntries = current.logEntries + "[$timestamp] $trimmed",
+                logRevision = current.logRevision + 1
+            )
         }
     }
 
-    private fun clearLogs() {
+    private fun startLogSession() {
         stateFlow.update { current ->
-            current.copy(logEntries = emptyList())
+            current.copy(
+                inProgress = true,
+                installedPackageName = null,
+                errorMessage = null,
+                successMessage = null,
+                logEntries = emptyList(),
+                logComplete = false,
+                logRevision = current.logRevision + 1,
+                logSessionId = current.logSessionId + 1
+            )
         }
     }
 
@@ -893,7 +677,7 @@ class SplitApkInstallerViewModel(
         appendLine("Input: ${stateFlow.value.inputName ?: "n/a"}")
         appendLine()
         appendLine("------------")
-        appendLine("Installer Log:")
+        appendLine("Raw installer log:")
         appendLine("------------")
         if (stateFlow.value.logEntries.isEmpty()) {
             appendLine("No log messages recorded.")
@@ -978,7 +762,6 @@ class SplitApkInstallerViewModel(
     companion object {
         private const val INSTALL_TIMEOUT_MS = 10 * 60 * 1000L
         private const val MIN_MANUAL_REFRESH_SHIMMER_MS = 3_000L
-        private val SESSION_ID_PATTERN = Regex("\\[(\\d+)]")
         private val PACKAGE_NAME_PATTERN = Regex("[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z0-9_]+)+")
     }
 }
@@ -994,7 +777,10 @@ data class SplitApkInstallerState(
     val statusMessage: String? = null,
     val errorMessage: String? = null,
     val successMessage: String? = null,
-    val logEntries: List<String> = emptyList()
+    val logEntries: List<String> = emptyList(),
+    val logComplete: Boolean = false,
+    val logRevision: Long = 0L,
+    val logSessionId: Long = 0L
 )
 
 enum class SplitInstallMode {
@@ -1002,96 +788,17 @@ enum class SplitInstallMode {
     PRIVILEGED
 }
 
-private data class InstallOutcome(
+internal data class InstallOutcome(
     val status: Int,
     val message: String?
 )
-
-private data class RootShellCommandResult(
-    val success: Boolean,
-    val code: Int,
-    val stdout: String,
-    val stderr: String
-)
-
-private class RootShellSession(
-    val process: Process
-) {
-    private val input = OutputStreamWriter(process.outputStream, StandardCharsets.UTF_8).buffered()
-    private val output = InputStreamReader(process.inputStream, StandardCharsets.UTF_8).buffered()
-
-    suspend fun exec(command: String): RootShellCommandResult = withContext(Dispatchers.IO) {
-        val marker = submitCommand(command)
-        val lines = mutableListOf<String>()
-        var exitCode: Int? = null
-        while (true) {
-            coroutineContext.ensureActive()
-            val line = output.readLine() ?: break
-            if (line.startsWith(marker)) {
-                exitCode = line.removePrefix(marker).trim().toIntOrNull() ?: 1
-                break
-            }
-            lines += line
-        }
-        buildResult(lines, exitCode)
-    }
-
-    fun execBlocking(command: String): RootShellCommandResult {
-        val marker = submitCommand(command)
-        val lines = mutableListOf<String>()
-        var exitCode: Int? = null
-        while (true) {
-            val line = output.readLine() ?: break
-            if (line.startsWith(marker)) {
-                exitCode = line.removePrefix(marker).trim().toIntOrNull() ?: 1
-                break
-            }
-            lines += line
-        }
-        return buildResult(lines, exitCode)
-    }
-
-    private fun submitCommand(command: String): String {
-        val marker = "__URV_RC_${System.nanoTime()}__"
-        input.write("{ $command; } 2>&1")
-        input.newLine()
-        input.write("echo $marker$?")
-        input.newLine()
-        input.flush()
-        return marker
-    }
-
-    private fun buildResult(lines: List<String>, exitCode: Int?): RootShellCommandResult {
-        val mergedOutput = lines.joinToString("\n").trim()
-        return RootShellCommandResult(
-            success = exitCode == 0,
-            code = exitCode ?: -1,
-            stdout = mergedOutput,
-            stderr = ""
-        )
-    }
-
-    fun isAlive(): Boolean = process.isAlive
-
-    fun close() {
-        runCatching {
-            input.write("exit")
-            input.newLine()
-            input.flush()
-        }
-        runCatching { input.close() }
-        runCatching { output.close() }
-        runCatching { process.inputStream.close() }
-        runCatching { process.errorStream.close() }
-    }
-}
 
 private data class ExtractedSplitApk(
     val originalName: String,
     val file: File
 )
 
-private fun Intent.readConfirmationIntent(): Intent? {
+internal fun Intent.readConfirmationIntent(): Intent? {
     return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         getParcelableExtra(Intent.EXTRA_INTENT, Intent::class.java)
     } else {
@@ -1100,7 +807,7 @@ private fun Intent.readConfirmationIntent(): Intent? {
     }
 }
 
-private object IntentSenderCompat {
+internal object IntentSenderCompat {
     fun create(callback: (Intent) -> Unit): IntentSender {
         val binder = object : android.content.IIntentSender.Stub() {
             override fun send(

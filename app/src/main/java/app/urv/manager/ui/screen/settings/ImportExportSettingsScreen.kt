@@ -67,6 +67,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.font.FontWeight
@@ -89,6 +90,9 @@ import app.urv.manager.ui.component.PasswordField
 import app.urv.manager.ui.component.SettingsSectionIcons
 import app.urv.manager.ui.component.bundle.BundleSelector
 import app.urv.manager.ui.component.patches.PathSelectorDialog
+import app.urv.manager.ui.component.RememberedCreateDocument
+import app.urv.manager.ui.component.RememberedGetContent
+import app.urv.manager.ui.component.toPickerDirectoryUri
 import app.urv.manager.ui.component.settings.ExpandableSettingListItem
 import app.urv.manager.ui.component.settings.ExpressiveSettingsCard
 import app.urv.manager.ui.component.settings.ExpressiveSettingsDivider
@@ -104,6 +108,7 @@ import app.urv.manager.util.uiSafe
 import app.urv.manager.util.permission.hasNotificationPermission
 import app.urv.manager.domain.repository.PatchBundleRepository.BundleImportPhase
 import app.urv.manager.domain.manager.PreferencesManager
+import app.urv.manager.domain.manager.base.Preference
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.koin.androidx.compose.koinViewModel
@@ -120,6 +125,18 @@ fun ImportExportSettingsScreen(
     val context = LocalContext.current
     val prefs: PreferencesManager = koinInject()
     val useCustomFilePicker by prefs.useCustomFilePicker.getAsState()
+    val keystoreImportDirectory by prefs.keystoreImportLastDirectory.getAsState()
+    val patchBundlesImportDirectory by prefs.patchBundlesImportLastDirectory.getAsState()
+    val patchProfilesImportDirectory by prefs.patchProfilesImportLastDirectory.getAsState()
+    val managerSettingsImportDirectory by prefs.managerSettingsImportLastDirectory.getAsState()
+    val everythingImportDirectory by prefs.everythingImportLastDirectory.getAsState()
+    val patchSelectionImportDirectory by prefs.patchSelectionImportLastDirectory.getAsState()
+    val currentKeystoreExportDirectory by prefs.currentKeystoreExportLastDirectory.getAsState()
+    val patchBundlesExportDirectory by prefs.patchBundlesExportLastDirectory.getAsState()
+    val patchProfilesExportDirectory by prefs.patchProfilesExportLastDirectory.getAsState()
+    val settingsBackupDirectory by prefs.settingsBackupLastDirectory.getAsState()
+    val everythingExportDirectory by prefs.everythingExportLastDirectory.getAsState()
+    val patchSelectionExportDirectory by prefs.patchSelectionExportLastDirectory.getAsState()
     val searchTarget by SettingsSearchState.target.collectAsStateWithLifecycle()
     var highlightTarget by rememberSaveable { mutableStateOf<Int?>(null) }
     val coroutineScope = rememberCoroutineScope()
@@ -136,6 +153,43 @@ fun ImportExportSettingsScreen(
     var exportFileDialogState by remember { mutableStateOf<ExportFileDialogState?>(null) }
     var pendingExportConfirmation by remember { mutableStateOf<PendingExportConfirmation?>(null) }
     var exportInProgress by rememberSaveable { mutableStateOf(false) }
+
+    fun importDirectoryPreference(picker: ImportPicker): Preference<String> = when (picker) {
+        ImportPicker.Keystore -> prefs.keystoreImportLastDirectory
+        ImportPicker.PatchBundles -> prefs.patchBundlesImportLastDirectory
+        ImportPicker.PatchProfiles -> prefs.patchProfilesImportLastDirectory
+        ImportPicker.ManagerSettings -> prefs.managerSettingsImportLastDirectory
+        ImportPicker.Everything -> prefs.everythingImportLastDirectory
+        ImportPicker.PatchSelection -> prefs.patchSelectionImportLastDirectory
+    }
+
+    fun importDirectory(picker: ImportPicker): String = when (picker) {
+        ImportPicker.Keystore -> keystoreImportDirectory
+        ImportPicker.PatchBundles -> patchBundlesImportDirectory
+        ImportPicker.PatchProfiles -> patchProfilesImportDirectory
+        ImportPicker.ManagerSettings -> managerSettingsImportDirectory
+        ImportPicker.Everything -> everythingImportDirectory
+        ImportPicker.PatchSelection -> patchSelectionImportDirectory
+    }
+
+    fun exportDirectoryPreference(picker: ExportPicker): Preference<String> = when (picker) {
+        ExportPicker.Keystore -> prefs.currentKeystoreExportLastDirectory
+        ExportPicker.PatchBundles -> prefs.patchBundlesExportLastDirectory
+        ExportPicker.PatchProfiles -> prefs.patchProfilesExportLastDirectory
+        ExportPicker.ManagerSettings -> prefs.settingsBackupLastDirectory
+        ExportPicker.Everything -> prefs.everythingExportLastDirectory
+        ExportPicker.PatchSelection -> prefs.patchSelectionExportLastDirectory
+    }
+
+    fun exportDirectory(picker: ExportPicker): String = when (picker) {
+        ExportPicker.Keystore -> currentKeystoreExportDirectory
+        ExportPicker.PatchBundles -> patchBundlesExportDirectory
+        ExportPicker.PatchProfiles -> patchProfilesExportDirectory
+        ExportPicker.ManagerSettings -> settingsBackupDirectory
+        ExportPicker.Everything -> everythingExportDirectory
+        ExportPicker.PatchSelection -> patchSelectionExportDirectory
+    }
+
     val permissionLauncher = rememberLauncherForActivityResult(permissionContract) { granted ->
         val pendingImport = pendingImportPicker
         val pendingExport = pendingExportPicker
@@ -162,7 +216,12 @@ fun ImportExportSettingsScreen(
         vm.onImportedNotificationPermissionResult(it)
     }
     val importDocumentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
+        contract = RememberedGetContent {
+            pendingDocumentImportPicker
+                ?.let(::importDirectory)
+                ?.takeIf(String::isNotBlank)
+                ?.let(Uri::parse)
+        }
     ) { uri ->
         val picker = pendingDocumentImportPicker
         pendingDocumentImportPicker = null
@@ -174,6 +233,9 @@ fun ImportExportSettingsScreen(
         if (!isValidImportUri(context, uri, picker)) {
             if (picker == ImportPicker.PatchSelection) vm.clearSelectionAction()
             return@rememberLauncherForActivityResult
+        }
+        coroutineScope.launch {
+            importDirectoryPreference(picker).update(uri.toPickerDirectoryUri().toString())
         }
         when (picker) {
             ImportPicker.Keystore -> vm.startKeystoreImport(uri)
@@ -209,7 +271,12 @@ fun ImportExportSettingsScreen(
         }
     }
     val exportDocumentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.CreateDocument("application/json")
+        contract = RememberedCreateDocument("application/json") {
+            pendingDocumentExportPicker
+                ?.let(::exportDirectory)
+                ?.takeIf(String::isNotBlank)
+                ?.let(Uri::parse)
+        }
     ) { uri ->
         val picker = pendingDocumentExportPicker
         pendingDocumentExportPicker = null
@@ -218,10 +285,15 @@ fun ImportExportSettingsScreen(
             if (picker == ExportPicker.PatchSelection) vm.clearSelectionAction()
             return@rememberLauncherForActivityResult
         }
+        coroutineScope.launch {
+            exportDirectoryPreference(picker).update(uri.toPickerDirectoryUri().toString())
+        }
         runDocumentExport(picker, uri)
     }
     val exportKeystoreDocumentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.CreateDocument("application/octet-stream")
+        contract = RememberedCreateDocument("application/octet-stream") {
+            currentKeystoreExportDirectory.takeIf(String::isNotBlank)?.let(Uri::parse)
+        }
     ) { uri ->
         val picker = pendingDocumentExportPicker
         pendingDocumentExportPicker = null
@@ -229,6 +301,9 @@ fun ImportExportSettingsScreen(
         if (uri == null) {
             if (picker == ExportPicker.PatchSelection) vm.clearSelectionAction()
             return@rememberLauncherForActivityResult
+        }
+        coroutineScope.launch {
+            exportDirectoryPreference(picker).update(uri.toPickerDirectoryUri().toString())
         }
         runDocumentExport(picker, uri)
     }
@@ -522,7 +597,8 @@ fun ImportExportSettingsScreen(
                         }
                     },
                     fileFilter = fileFilter,
-                    allowDirectorySelection = false
+                    allowDirectorySelection = false,
+                    lastDirectoryPreference = importDirectoryPreference(picker)
                 )
             }
             if (useCustomFilePicker) activeExportPicker?.let { picker ->
@@ -563,7 +639,8 @@ fun ImportExportSettingsScreen(
                             directory = directory,
                             fileName = resolveExportFileName(picker)
                         )
-                    }
+                    },
+                    lastDirectoryPreference = exportDirectoryPreference(picker)
                 )
             }
             if (useCustomFilePicker) exportFileDialogState?.let { state ->
@@ -607,8 +684,9 @@ fun ImportExportSettingsScreen(
                     )
             ) {
                 importProgress?.let { progress ->
+                    val total = progress.total.coerceAtLeast(1)
+                    val bundleCount = progress.bundleCount.coerceAtLeast(1)
                     val subtitleParts = buildList {
-                        val total = progress.total.coerceAtLeast(1)
                         val stepLabel = if (progress.isStepBased) {
                             val step = (progress.processed + 1).coerceAtMost(total)
                             stringResource(R.string.import_patch_bundles_banner_steps, step, total)
@@ -653,7 +731,10 @@ fun ImportExportSettingsScreen(
                         add(detail)
                     }
                     DownloadProgressBanner(
-                        title = stringResource(R.string.import_patch_bundles_banner_title),
+                        title = pluralStringResource(
+                            R.plurals.import_patch_bundles_banner_title_quantity,
+                            bundleCount
+                        ),
                         subtitle = subtitleParts.joinToString(" - "),
                         progress = progress.ratio,
                         modifier = Modifier

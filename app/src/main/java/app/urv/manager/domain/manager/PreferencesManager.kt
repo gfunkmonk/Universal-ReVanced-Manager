@@ -19,6 +19,7 @@ import app.urv.manager.ui.model.PatchSelectionActionKey
 import app.urv.manager.ui.model.PatchBundleActionKey
 import app.urv.manager.ui.model.SavedAppActionKey
 import app.urv.manager.ui.model.PatchProfileActionKey
+import app.urv.manager.ui.model.LsposedModuleActionKey
 
 enum class SearchForUpdatesBackgroundInterval(val displayName: Int, val value: Long) {
     NEVER(R.string.never, 0),
@@ -44,6 +45,11 @@ class PreferencesManager(
     context: Context
 ) : BasePreferencesManager(context, "settings") {
     companion object {
+        private val MANAGER_PRERELEASE_VERSION_REGEX = Regex("""\d+\.\d+\.\d+-.+""")
+        private fun isManagerPrereleaseVersion(versionName: String): Boolean =
+            MANAGER_PRERELEASE_VERSION_REGEX.matches(
+                versionName.removePrefix("v").substringBefore('+')
+            )
         private val PATCH_ACTION_ORDER_DEFAULT =
             PatchSelectionActionKey.DefaultOrder.joinToString(",") { it.storageId }
         private val PATCH_BUNDLE_ACTION_ORDER_DEFAULT =
@@ -52,6 +58,8 @@ class PreferencesManager(
             SavedAppActionKey.DefaultOrder.joinToString(",") { it.storageId }
         private val PATCH_PROFILE_ACTION_ORDER_DEFAULT =
             PatchProfileActionKey.DefaultOrder.joinToString(",") { it.storageId }
+        private val LSPOSED_MODULE_ACTION_ORDER_DEFAULT =
+            LsposedModuleActionKey.DefaultOrder.joinToString(",") { it.storageId }
         val DEFAULT_ANNOUNCEMENT_TAGS: Set<String> = emptySet()
         const val MIN_BUNDLE_CHANGELOG_HISTORY_LIMIT = 1
         const val DEFAULT_BUNDLE_CHANGELOG_FETCH_LIMIT = 20
@@ -72,6 +80,7 @@ class PreferencesManager(
     val preventAccidentalTouching = booleanPreference("prevent_accidental_touching", true)
     val showPatchProfilesTab = booleanPreference("show_patch_profiles_tab", true)
     val showToolsTab = booleanPreference("show_tools_tab", true)
+    val showLsposedTab = booleanPreference("show_lsposed_tab", false)
     val theme = enumPreference("theme", Theme.SYSTEM)
     val appLanguage = stringPreference("app_language", "system")
 
@@ -82,7 +91,9 @@ class PreferencesManager(
 
     val stripUnusedNativeLibs = booleanPreference("strip_unused_native_libs", false)
     val skipUnneededSplitApks = booleanPreference("skip_unneeded_split_apks", false)
+    val chooseSplitApksBeforePatching = booleanPreference("choose_split_apks_before_patching", false)
     val continueOnPatchError = booleanPreference("continue_on_patch_error", false)
+    val skipApkSigning = booleanPreference("skip_apk_signing", false)
     val morpheBytecodeMode = enumPreference("morphe_bytecode_mode", MorpheBytecodeMode.FAST)
     val patcherLogMode = enumPreference("patcher_log_mode", PatcherLogMode.DEFAULT)
     val patchedAppExportFormat = stringPreference(
@@ -99,7 +110,15 @@ class PreferencesManager(
     val patchBundleCacheVersionCode = intPreference("patch_bundle_cache_version_code", -1)
     val dashboardBundlesFabCollapsed = booleanPreference("dashboard_bundles_fab_collapsed", false)
     val dashboardAppsFabCollapsed = booleanPreference("dashboard_apps_fab_collapsed", false)
-    val dashboardProgressBannerCollapsed = booleanPreference("dashboard_progress_banner_collapsed", false)
+    val dashboardLsposedFabCollapsed = booleanPreference("dashboard_lsposed_fab_collapsed", false)
+    private val dashboardProgressBannerCollapsed =
+        booleanPreference("dashboard_progress_banner_collapsed", false)
+    private val dashboardBundleBannerStateMigrated =
+        booleanPreference("dashboard_bundle_banner_state_migrated", false)
+    val dashboardBundleImportBannerCollapsed =
+        booleanPreference("dashboard_bundle_import_banner_collapsed", false)
+    val dashboardBundleUpdateBannerCollapsed =
+        booleanPreference("dashboard_bundle_update_banner_collapsed", false)
     val autoCollapsePatcherSteps = booleanPreference("auto_collapse_patcher_steps", false)
     val showPatcherMemoryUsageGraph = booleanPreference("show_patcher_memory_usage_graph", true)
     val autoExpandRunningSteps = booleanPreference("auto_expand_running_steps", true)
@@ -119,6 +138,16 @@ class PreferencesManager(
     val keystoreAlias = stringPreference("keystore_alias", KeystoreManager.DEFAULT_ALIAS)
     val keystorePass = stringPreference("keystore_pass", KeystoreManager.DEFAULT_PASSWORD)
     val keystoreKeyPass = stringPreference("keystore_key_pass", KeystoreManager.DEFAULT_KEY_PASSWORD)
+
+    suspend fun migrateDashboardBundleBannerState() {
+        if (dashboardBundleBannerStateMigrated.get()) return
+        edit {
+            val legacyState = dashboardProgressBannerCollapsed.value
+            dashboardBundleImportBannerCollapsed.value = legacyState
+            dashboardBundleUpdateBannerCollapsed.value = legacyState
+            dashboardBundleBannerStateMigrated.value = true
+        }
+    }
 
     val firstLaunch = booleanPreference("first_launch", true)
     val managerAutoUpdates = booleanPreference("manager_auto_updates", false)
@@ -143,6 +172,8 @@ class PreferencesManager(
     val selectedAnnouncementTags =
         stringSetPreference("selected_announcement_tags", DEFAULT_ANNOUNCEMENT_TAGS)
     val useManagerPrereleases = booleanPreference("manager_prereleases", false)
+    private val managerPrereleaseAutoEnabledVersion =
+        stringPreference("manager_prerelease_auto_enabled_version", "")
     val usePatchesPrereleases = booleanPreference("patches_prereleases", false)
     val showBatteryOptimizationBanner = booleanPreference("show_battery_optimization_banner", true)
     val allowPatchProfileBundleOverride = booleanPreference(
@@ -198,11 +229,97 @@ class PreferencesManager(
         stringPreference("patch_profile_action_order", PATCH_PROFILE_ACTION_ORDER_DEFAULT)
     val patchProfileHiddenActions =
         stringSetPreference("patch_profile_hidden_actions", emptySet())
+    val lsposedModuleActionOrder =
+        stringPreference("lsposed_module_action_order", LSPOSED_MODULE_ACTION_ORDER_DEFAULT)
+    val lsposedModuleHiddenActions =
+        stringSetPreference("lsposed_module_hidden_actions", emptySet())
     val patchSelectionHiddenActions =
         stringSetPreference("patch_selection_hidden_actions", emptySet())
     val patchSelectionShowVersionTags = booleanPreference("patch_selection_show_version_tags", true)
+    val patchSelectionShowOptionPreviews =
+        booleanPreference("patch_selection_show_option_previews", true)
+
+    suspend fun setMinimalPatchSelectionView(enabled: Boolean) = edit {
+        patchSelectionShowVersionTags.value = !enabled
+        patchSelectionShowOptionPreviews.value = !enabled
+    }
+
     val pathSelectorFavorites = stringSetPreference("path_selector_favorites", emptySet())
     val pathSelectorLastDirectory = stringPreference("path_selector_last_directory", "")
+    val apkInputLastDirectory = stringPreference("file_picker_apk_input_directory", "")
+    val selectedAppApkInputLastDirectory =
+        stringPreference("file_picker_selected_app_apk_input_directory", "")
+    val patchProfileApkInputLastDirectory =
+        stringPreference("file_picker_patch_profile_apk_input_directory", "")
+    val dashboardApkInputLastDirectory =
+        stringPreference("file_picker_dashboard_apk_input_directory", "")
+    val patchedApkExportLastDirectory = stringPreference("file_picker_patched_apk_export_directory", "")
+    val savedAppExportLastDirectory =
+        stringPreference("file_picker_saved_app_export_directory", "")
+    val dashboardQuickExportLastDirectory =
+        stringPreference("file_picker_dashboard_quick_export_directory", "")
+    val dashboardBundleInputLastDirectory =
+        stringPreference("file_picker_dashboard_bundle_input_directory", "")
+    val dashboardSplitInputLastDirectory =
+        stringPreference("file_picker_dashboard_split_input_directory", "")
+    val dashboardSavedAppsExportLastDirectory =
+        stringPreference("file_picker_dashboard_saved_apps_export_directory", "")
+    val settingsBackupLastDirectory = stringPreference("file_picker_settings_backup_directory", "")
+    val keystoreImportLastDirectory = stringPreference("file_picker_keystore_import_directory", "")
+    val patchBundlesImportLastDirectory =
+        stringPreference("file_picker_patch_bundles_import_directory", "")
+    val patchProfilesImportLastDirectory =
+        stringPreference("file_picker_patch_profiles_import_directory", "")
+    val managerSettingsImportLastDirectory =
+        stringPreference("file_picker_manager_settings_import_directory", "")
+    val everythingImportLastDirectory =
+        stringPreference("file_picker_everything_import_directory", "")
+    val patchSelectionImportLastDirectory =
+        stringPreference("file_picker_patch_selection_import_directory", "")
+    val patchBundlesExportLastDirectory =
+        stringPreference("file_picker_patch_bundles_export_directory", "")
+    val patchProfilesExportLastDirectory =
+        stringPreference("file_picker_patch_profiles_export_directory", "")
+    val everythingExportLastDirectory =
+        stringPreference("file_picker_everything_export_directory", "")
+    val patchSelectionExportLastDirectory =
+        stringPreference("file_picker_patch_selection_export_directory", "")
+    val currentKeystoreExportLastDirectory = stringPreference("file_picker_current_keystore_export_directory", "")
+    val youtubeAssetsExportLastDirectory = stringPreference("file_picker_youtube_assets_export_directory", "")
+    val mergedApkExportLastDirectory = stringPreference("file_picker_merged_apk_export_directory", "")
+    val signedApkExportLastDirectory = stringPreference("file_picker_signed_apk_export_directory", "")
+    val signatureMetadataExportLastDirectory =
+        stringPreference("file_picker_signature_metadata_export_directory", "")
+    val signatureMetadataLogExportLastDirectory =
+        stringPreference("file_picker_signature_metadata_log_export_directory", "")
+    val createdKeystoreExportLastDirectory = stringPreference("file_picker_created_keystore_export_directory", "")
+    val convertedKeystoreExportLastDirectory = stringPreference("file_picker_converted_keystore_export_directory", "")
+    val apkSignerInputLastDirectory = stringPreference("file_picker_apk_signer_input_directory", "")
+    val signatureMetadataSourceInputLastDirectory =
+        stringPreference("file_picker_signature_metadata_archive_input_directory", "")
+    val signatureMetadataApkInputLastDirectory =
+        stringPreference("file_picker_signature_metadata_apk_input_directory", "")
+    val lsposedModuleInputLastDirectory =
+        stringPreference("file_picker_lsposed_module_input_directory", "")
+    val youtubeImageInputLastDirectory = stringPreference("file_picker_youtube_image_input_directory", "")
+    val keystoreConverterInputLastDirectory =
+        stringPreference("file_picker_keystore_converter_input_directory", "")
+    val patchOptionFileInputLastDirectory =
+        stringPreference("file_picker_patch_option_file_input_directory", "")
+    val mergeLogExportLastDirectory = stringPreference("file_picker_merge_log_export_directory", "")
+    val patcherLogExportLastDirectory = stringPreference("file_picker_patcher_log_export_directory", "")
+    val patchBundleDiscoveryExportLastDirectory =
+        stringPreference("file_picker_patch_bundle_discovery_export_directory", "")
+    val splitInstallerInputLastDirectory =
+        stringPreference("file_picker_split_installer_input_directory", "")
+    val splitInstallerLogExportLastDirectory =
+        stringPreference("file_picker_split_installer_log_export_directory", "")
+    val advancedLogExportLastDirectory =
+        stringPreference("file_picker_advanced_log_export_directory", "")
+    val downloadsExportLastDirectory = stringPreference("file_picker_downloads_export_directory", "")
+    val backgroundImageInputLastDirectory =
+        stringPreference("file_picker_background_image_input_directory", "")
+    val contentSelectorLastDirectory = stringPreference("file_picker_content_selector_directory", "")
     val pathSelectorSortMode = stringPreference("path_selector_sort_mode", "MODIFIED_DESC")
     val pathSelectorSearchQuery = stringPreference("path_selector_search_query", "")
     val appSelectorFilterInstalledOnly = booleanPreference("app_selector_filter_installed_only", false)
@@ -211,6 +328,7 @@ class PreferencesManager(
     val splitMergeExcludeUnusedLanguages = booleanPreference("split_merge_exclude_unused_languages", false)
     val splitMergeExcludeExtraDensities = booleanPreference("split_merge_exclude_extra_densities", false)
     val splitMergeExcludeExtraNativeLibs = booleanPreference("split_merge_exclude_extra_native_libs", false)
+    val splitMergeModuleSortMode = stringPreference("split_merge_module_sort_mode", "DEFAULT")
     val splitMergeInstalledFilterUserApps = booleanPreference("split_merge_installed_filter_user_apps", false)
     val splitMergeInstalledFilterSystemApps = booleanPreference("split_merge_installed_filter_system_apps", false)
     val splitMergeInstalledFilterSplitApks = booleanPreference("split_merge_installed_filter_split_apks", false)
@@ -255,11 +373,14 @@ class PreferencesManager(
         val preventAccidentalTouching: Boolean? = null,
         val showPatchProfilesTab: Boolean? = null,
         val showToolsTab: Boolean? = null,
+        val showLsposedTab: Boolean? = null,
         val themePresetSelectionName: String? = null,
         val themePresetSelectionEnabled: Boolean? = null,
         val stripUnusedNativeLibs: Boolean? = null,
         val skipUnneededSplitApks: Boolean? = null,
+        val chooseSplitApksBeforePatching: Boolean? = null,
         val continueOnPatchError: Boolean? = null,
+        val skipApkSigning: Boolean? = null,
         val morpheBytecodeMode: String? = null,
         val patcherLogMode: PatcherLogMode? = null,
         val theme: Theme? = null,
@@ -281,6 +402,8 @@ class PreferencesManager(
         val dashboardBundlesFabCollapsed: Boolean? = null,
         val dashboardAppsFabCollapsed: Boolean? = null,
         val dashboardProgressBannerCollapsed: Boolean? = null,
+        val dashboardBundleImportBannerCollapsed: Boolean? = null,
+        val dashboardBundleUpdateBannerCollapsed: Boolean? = null,
         val allowMeteredUpdates: Boolean? = null,
         val chooseInstallerPerInstall: Boolean? = null,
         val installerPrimary: String? = null,
@@ -322,12 +445,15 @@ class PreferencesManager(
         val patchSelectionActionOrder: String? = null,
         val patchSelectionHiddenActions: Set<String>? = null,
         val patchSelectionShowVersionTags: Boolean? = null,
+        val patchSelectionShowOptionPreviews: Boolean? = null,
         val patchBundleActionOrder: String? = null,
         val patchBundleHiddenActions: Set<String>? = null,
         val savedAppActionOrder: String? = null,
         val savedAppHiddenActions: Set<String>? = null,
         val patchProfileActionOrder: String? = null,
         val patchProfileHiddenActions: Set<String>? = null,
+        val lsposedModuleActionOrder: String? = null,
+        val lsposedModuleHiddenActions: Set<String>? = null,
         val acknowledgedDownloaderPlugins: Set<String>? = null,
         val downloaderPluginSourcesJson: String? = null,
         val acknowledgedPatcherRuntimePlugins: Set<String>? = null,
@@ -343,6 +469,7 @@ class PreferencesManager(
         val splitMergeExcludeUnusedLanguages: Boolean? = null,
         val splitMergeExcludeExtraDensities: Boolean? = null,
         val splitMergeExcludeExtraNativeLibs: Boolean? = null,
+        val splitMergeModuleSortMode: String? = null,
         val splitMergeInstalledFilterUserApps: Boolean? = null,
         val splitMergeInstalledFilterSystemApps: Boolean? = null,
         val splitMergeInstalledFilterSplitApks: Boolean? = null,
@@ -393,6 +520,27 @@ class PreferencesManager(
         announcementPushNotificationIntervalMigrated.value = true
     }
 
+    suspend fun enableManagerPrereleasesForVersion(versionName: String) {
+        val normalizedVersion = versionName.removePrefix("v").substringBefore('+')
+        if (!isManagerPrereleaseVersion(normalizedVersion)) {
+            if (managerPrereleaseAutoEnabledVersion.get().isNotEmpty()) {
+                managerPrereleaseAutoEnabledVersion.update("")
+            }
+            return
+        }
+
+        edit {
+            if (managerPrereleaseAutoEnabledVersion.value == normalizedVersion) return@edit
+            useManagerPrereleases.value = true
+            managerPrereleaseAutoEnabledVersion.value = normalizedVersion
+        }
+    }
+
+    suspend fun useManagerPrereleasesForVersion(versionName: String): Boolean {
+        enableManagerPrereleasesForVersion(versionName)
+        return useManagerPrereleases.get()
+    }
+
     private suspend fun exportAppearanceSettings(snapshot: SettingsSnapshot): SettingsSnapshot {
         return snapshot.copy(
             dynamicColor = dynamicColor.get(),
@@ -407,6 +555,7 @@ class PreferencesManager(
             preventAccidentalTouching = preventAccidentalTouching.get(),
             showPatchProfilesTab = showPatchProfilesTab.get(),
             showToolsTab = showToolsTab.get(),
+            showLsposedTab = showLsposedTab.get(),
             themePresetSelectionName = themePresetSelectionName.get(),
             themePresetSelectionEnabled = themePresetSelectionEnabled.get(),
             theme = theme.get(),
@@ -445,7 +594,9 @@ class PreferencesManager(
         return snapshot.copy(
             stripUnusedNativeLibs = stripUnusedNativeLibs.get(),
             skipUnneededSplitApks = skipUnneededSplitApks.get(),
+            chooseSplitApksBeforePatching = chooseSplitApksBeforePatching.get(),
             continueOnPatchError = continueOnPatchError.get(),
+            skipApkSigning = skipApkSigning.get(),
             morpheBytecodeMode = morpheBytecodeMode.get().runtimeValue,
             patcherLogMode = patcherLogMode.get(),
             autoCollapsePatcherSteps = autoCollapsePatcherSteps.get(),
@@ -467,7 +618,10 @@ class PreferencesManager(
             keystoreKeyPass = keystoreKeyPass.get(),
             dashboardBundlesFabCollapsed = dashboardBundlesFabCollapsed.get(),
             dashboardAppsFabCollapsed = dashboardAppsFabCollapsed.get(),
-            dashboardProgressBannerCollapsed = dashboardProgressBannerCollapsed.get()
+            dashboardProgressBannerCollapsed =
+                dashboardBundleImportBannerCollapsed.get() && dashboardBundleUpdateBannerCollapsed.get(),
+            dashboardBundleImportBannerCollapsed = dashboardBundleImportBannerCollapsed.get(),
+            dashboardBundleUpdateBannerCollapsed = dashboardBundleUpdateBannerCollapsed.get()
         )
     }
 
@@ -491,12 +645,15 @@ class PreferencesManager(
             patchSelectionActionOrder = patchSelectionActionOrder.get(),
             patchSelectionHiddenActions = patchSelectionHiddenActions.get(),
             patchSelectionShowVersionTags = patchSelectionShowVersionTags.get(),
+            patchSelectionShowOptionPreviews = patchSelectionShowOptionPreviews.get(),
             patchBundleActionOrder = patchBundleActionOrder.get(),
             patchBundleHiddenActions = patchBundleHiddenActions.get(),
             savedAppActionOrder = savedAppActionOrder.get(),
             savedAppHiddenActions = savedAppHiddenActions.get(),
             patchProfileActionOrder = patchProfileActionOrder.get(),
-            patchProfileHiddenActions = patchProfileHiddenActions.get()
+            patchProfileHiddenActions = patchProfileHiddenActions.get(),
+            lsposedModuleActionOrder = lsposedModuleActionOrder.get(),
+            lsposedModuleHiddenActions = lsposedModuleHiddenActions.get()
         )
     }
 
@@ -519,6 +676,7 @@ class PreferencesManager(
             splitMergeExcludeUnusedLanguages = splitMergeExcludeUnusedLanguages.get(),
             splitMergeExcludeExtraDensities = splitMergeExcludeExtraDensities.get(),
             splitMergeExcludeExtraNativeLibs = splitMergeExcludeExtraNativeLibs.get(),
+            splitMergeModuleSortMode = splitMergeModuleSortMode.get().takeIf { it.isNotBlank() },
             splitMergeInstalledFilterUserApps = splitMergeInstalledFilterUserApps.get(),
             splitMergeInstalledFilterSystemApps = splitMergeInstalledFilterSystemApps.get(),
             splitMergeInstalledFilterSplitApks = splitMergeInstalledFilterSplitApks.get(),
@@ -548,6 +706,7 @@ class PreferencesManager(
         snapshot.preventAccidentalTouching?.let { preventAccidentalTouching.value = it }
         snapshot.showPatchProfilesTab?.let { showPatchProfilesTab.value = it }
         snapshot.showToolsTab?.let { showToolsTab.value = it }
+        snapshot.showLsposedTab?.let { showLsposedTab.value = it }
         snapshot.themePresetSelectionName?.let { themePresetSelectionName.value = it }
         snapshot.themePresetSelectionEnabled?.let { themePresetSelectionEnabled.value = it }
         snapshot.theme?.let { theme.value = it }
@@ -602,7 +761,9 @@ class PreferencesManager(
     private fun EditorContext.importRuntimeAndInstallerSettings(snapshot: SettingsSnapshot) {
         snapshot.stripUnusedNativeLibs?.let { stripUnusedNativeLibs.value = it }
         snapshot.skipUnneededSplitApks?.let { skipUnneededSplitApks.value = it }
+        snapshot.chooseSplitApksBeforePatching?.let { chooseSplitApksBeforePatching.value = it }
         snapshot.continueOnPatchError?.let { continueOnPatchError.value = it }
+        snapshot.skipApkSigning?.let { skipApkSigning.value = it }
         snapshot.morpheBytecodeMode?.let {
             morpheBytecodeMode.value = MorpheBytecodeMode.fromRuntimeValue(it)
         }
@@ -626,7 +787,14 @@ class PreferencesManager(
         snapshot.keystoreKeyPass?.let { keystoreKeyPass.value = it }
         snapshot.dashboardBundlesFabCollapsed?.let { dashboardBundlesFabCollapsed.value = it }
         snapshot.dashboardAppsFabCollapsed?.let { dashboardAppsFabCollapsed.value = it }
-        snapshot.dashboardProgressBannerCollapsed?.let { dashboardProgressBannerCollapsed.value = it }
+        val legacyBannerState = snapshot.dashboardProgressBannerCollapsed
+        (snapshot.dashboardBundleImportBannerCollapsed ?: legacyBannerState)?.let {
+            dashboardBundleImportBannerCollapsed.value = it
+        }
+        (snapshot.dashboardBundleUpdateBannerCollapsed ?: legacyBannerState)?.let {
+            dashboardBundleUpdateBannerCollapsed.value = it
+        }
+        dashboardBundleBannerStateMigrated.value = true
     }
 
     private fun EditorContext.importPatchingSettings(snapshot: SettingsSnapshot) {
@@ -648,12 +816,17 @@ class PreferencesManager(
         snapshot.patchSelectionActionOrder?.let { patchSelectionActionOrder.value = it }
         snapshot.patchSelectionHiddenActions?.let { patchSelectionHiddenActions.value = it }
         snapshot.patchSelectionShowVersionTags?.let { patchSelectionShowVersionTags.value = it }
+        snapshot.patchSelectionShowOptionPreviews?.let {
+            patchSelectionShowOptionPreviews.value = it
+        }
         snapshot.patchBundleActionOrder?.let { patchBundleActionOrder.value = it }
         snapshot.patchBundleHiddenActions?.let { patchBundleHiddenActions.value = it }
         snapshot.savedAppActionOrder?.let { savedAppActionOrder.value = it }
         snapshot.savedAppHiddenActions?.let { savedAppHiddenActions.value = it }
         snapshot.patchProfileActionOrder?.let { patchProfileActionOrder.value = it }
         snapshot.patchProfileHiddenActions?.let { patchProfileHiddenActions.value = it }
+        snapshot.lsposedModuleActionOrder?.let { lsposedModuleActionOrder.value = it }
+        snapshot.lsposedModuleHiddenActions?.let { lsposedModuleHiddenActions.value = it }
     }
 
     private fun EditorContext.importDiscoverySettings(snapshot: SettingsSnapshot) {
@@ -696,6 +869,9 @@ class PreferencesManager(
         snapshot.splitMergeExcludeUnusedLanguages?.let { splitMergeExcludeUnusedLanguages.value = it }
         snapshot.splitMergeExcludeExtraDensities?.let { splitMergeExcludeExtraDensities.value = it }
         snapshot.splitMergeExcludeExtraNativeLibs?.let { splitMergeExcludeExtraNativeLibs.value = it }
+        snapshot.splitMergeModuleSortMode?.takeIf { it.isNotBlank() }?.let {
+            splitMergeModuleSortMode.value = it
+        }
         snapshot.splitMergeInstalledFilterUserApps?.let { splitMergeInstalledFilterUserApps.value = it }
         snapshot.splitMergeInstalledFilterSystemApps?.let { splitMergeInstalledFilterSystemApps.value = it }
         snapshot.splitMergeInstalledFilterSplitApks?.let { splitMergeInstalledFilterSplitApks.value = it }

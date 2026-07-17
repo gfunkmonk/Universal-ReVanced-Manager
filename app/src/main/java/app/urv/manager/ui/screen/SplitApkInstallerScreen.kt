@@ -7,8 +7,10 @@ import android.content.Intent
 import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -17,10 +19,12 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.OpenInNew
@@ -30,29 +34,36 @@ import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Cancel
 import androidx.compose.material.icons.outlined.Build
 import androidx.compose.material.icons.outlined.Description
-import androidx.compose.material.icons.outlined.PostAdd
+import androidx.compose.material.icons.outlined.ExpandLess
+import androidx.compose.material.icons.outlined.ExpandMore
+import androidx.compose.material.icons.outlined.KeyboardArrowDown
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
@@ -69,6 +80,9 @@ import app.urv.manager.ui.component.ExportSavedApkFileNameDialog
 import app.urv.manager.ui.component.InterceptBackHandler
 import app.urv.manager.ui.component.ShimmerBox
 import app.urv.manager.ui.component.patches.PathSelectorDialog
+import app.urv.manager.ui.component.RememberedCreateDocument
+import app.urv.manager.ui.component.RememberedOpenDocument
+import app.urv.manager.ui.component.toPickerDirectoryUri
 import app.urv.manager.ui.viewmodel.SplitApkInstallerViewModel
 import app.urv.manager.ui.viewmodel.SplitInstallMode
 import app.urv.manager.util.SPLIT_ARCHIVE_MIME_TYPES
@@ -82,6 +96,7 @@ import java.nio.file.Path
 import kotlin.io.path.isDirectory
 import org.koin.androidx.compose.koinViewModel
 import org.koin.compose.koinInject
+import kotlinx.coroutines.launch
 import app.urv.manager.ui.component.CenteredDialogTitle
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -97,13 +112,15 @@ fun SplitApkInstallerScreen(
     val fs: Filesystem = koinInject()
     val prefs: PreferencesManager = koinInject()
     val useCustomFilePicker by prefs.useCustomFilePicker.getAsState()
+    val splitInstallerInputDirectory by prefs.splitInstallerInputLastDirectory.getAsState()
+    val splitInstallerLogExportDirectory by prefs.splitInstallerLogExportLastDirectory.getAsState()
+    val pickerScope = rememberCoroutineScope()
     val storageRoots = remember { fs.storageRoots() }
     val (permissionContract, permissionName) = remember { fs.permissionContract() }
 
     var pendingMode by rememberSaveable { mutableStateOf<SplitInstallMode?>(null) }
     var showInputPicker by rememberSaveable { mutableStateOf(false) }
     var showDismissConfirmationDialog by rememberSaveable { mutableStateOf(false) }
-    var showLogActionsDialog by rememberSaveable { mutableStateOf(false) }
     var showLogExportPicker by rememberSaveable { mutableStateOf(false) }
     var logExportInProgress by rememberSaveable { mutableStateOf(false) }
     var logExportFileDialogState by remember { mutableStateOf<SplitInstallerLogExportDialogState?>(null) }
@@ -129,11 +146,16 @@ fun SplitApkInstallerScreen(
     }
 
     val splitArchiveLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
+        contract = RememberedOpenDocument {
+            splitInstallerInputDirectory.takeIf(String::isNotBlank)?.let(Uri::parse)
+        }
     ) { uri: Uri? ->
         val mode = pendingMode
         pendingMode = null
         if (mode == null || uri == null) return@rememberLauncherForActivityResult
+        pickerScope.launch {
+            prefs.splitInstallerInputLastDirectory.update(uri.toPickerDirectoryUri().toString())
+        }
 
         val displayName = resolveDisplayName(context.contentResolver, uri)
 
@@ -151,8 +173,15 @@ fun SplitApkInstallerScreen(
         )
     }
     val logExportDocumentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.CreateDocument("text/plain")
+        contract = RememberedCreateDocument("text/plain") {
+            splitInstallerLogExportDirectory.takeIf(String::isNotBlank)?.let(Uri::parse)
+        }
     ) { uri ->
+        uri?.let {
+            pickerScope.launch {
+                prefs.splitInstallerLogExportLastDirectory.update(it.toPickerDirectoryUri().toString())
+            }
+        }
         vm.exportLogsToUri(context, uri)
         showLogExportPicker = false
         pendingLogExportFileName = null
@@ -191,7 +220,20 @@ fun SplitApkInstallerScreen(
         }
     }
 
+    fun copyLog() {
+        if (state.logEntries.isEmpty()) return
+        val clipboard = context.getSystemService(ClipboardManager::class.java) ?: return
+        clipboard.setPrimaryClip(
+            ClipData.newPlainText(
+                "Raw installer log",
+                vm.getLogContent(context)
+            )
+        )
+        context.toast(context.getString(R.string.split_installer_log_copy_success))
+    }
+
     fun openLogExportPicker() {
+        if (state.logEntries.isEmpty()) return
         val logFileName = FilenameUtils.timestampedLogFileName("installer")
         pendingLogExportFileName = logFileName
         if (useCustomFilePicker) {
@@ -222,100 +264,6 @@ fun SplitApkInstallerScreen(
         )
     }
 
-    if (showLogActionsDialog) {
-        AlertDialog(
-            onDismissRequest = { showLogActionsDialog = false },
-            confirmButton = {
-                TextButton(onClick = { showLogActionsDialog = false }) {
-                    Text(stringResource(R.string.cancel))
-                }
-            },
-            icon = { Icon(Icons.Outlined.PostAdd, null) },
-            title = { CenteredDialogTitle(stringResource(R.string.split_installer_log_actions_title)) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text(
-                        text = stringResource(R.string.split_installer_log_actions_description),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    ElevatedCard(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable {
-                                val clipboard = context.getSystemService(ClipboardManager::class.java)
-                                if (clipboard != null) {
-                                    clipboard.setPrimaryClip(
-                                        ClipData.newPlainText(
-                                            "Installer log",
-                                            vm.getLogContent(context)
-                                        )
-                                    )
-                                    context.toast(context.getString(R.string.split_installer_log_copy_success))
-                                }
-                                showLogActionsDialog = false
-                            }
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(16.dp),
-                            horizontalArrangement = Arrangement.spacedBy(12.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = Icons.Outlined.ContentCopy,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.primary
-                            )
-                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text(
-                                    text = stringResource(R.string.split_installer_log_copy),
-                                    style = MaterialTheme.typography.titleMedium
-                                )
-                                Text(
-                                    text = stringResource(R.string.split_installer_log_copy_description),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
-                    }
-                    ElevatedCard(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable {
-                                showLogActionsDialog = false
-                                openLogExportPicker()
-                            }
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(16.dp),
-                            horizontalArrangement = Arrangement.spacedBy(12.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = Icons.Outlined.Description,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.primary
-                            )
-                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text(
-                                    text = stringResource(R.string.split_installer_log_export),
-                                    style = MaterialTheme.typography.titleMedium
-                                )
-                                Text(
-                                    text = stringResource(R.string.split_installer_log_export_description),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
-                    }
-                }
-            },
-            dismissButton = {}
-        )
-    }
-
     if (showInputPicker && useCustomFilePicker) {
         PathSelectorDialog(
             roots = storageRoots,
@@ -336,7 +284,8 @@ fun SplitApkInstallerScreen(
                 }
             },
             fileFilter = ::isAllowedSplitArchiveFile,
-            allowDirectorySelection = false
+            allowDirectorySelection = false,
+            lastDirectoryPreference = prefs.splitInstallerInputLastDirectory
         )
     }
     if (showLogExportPicker && useCustomFilePicker) {
@@ -362,7 +311,8 @@ fun SplitApkInstallerScreen(
                     exportDirectory,
                     pendingLogExportFileName ?: FilenameUtils.timestampedLogFileName("installer")
                 )
-            }
+            },
+            lastDirectoryPreference = prefs.splitInstallerLogExportLastDirectory
         )
     }
     LaunchedEffect(showLogExportPicker, useCustomFilePicker, pendingLogExportFileName) {
@@ -424,11 +374,6 @@ fun SplitApkInstallerScreen(
     val availabilityLabelUnavailable = stringResource(R.string.split_installer_status_unavailable)
     val contentScrollState = rememberScrollState()
     val logScrollState = rememberScrollState()
-    LaunchedEffect(state.logEntries.size) {
-        if (state.logEntries.isNotEmpty()) {
-            logScrollState.scrollTo(logScrollState.maxValue)
-        }
-    }
 
     AppScaffold(
         topBar = { scrollBehavior ->
@@ -437,15 +382,6 @@ fun SplitApkInstallerScreen(
                 scrollBehavior = scrollBehavior,
                 onBackClick = ::onPageBack,
                 actions = {
-                    IconButton(
-                        onClick = { showLogActionsDialog = true },
-                        enabled = state.logEntries.isNotEmpty()
-                    ) {
-                        Icon(
-                            imageVector = Icons.Outlined.PostAdd,
-                            contentDescription = stringResource(R.string.split_installer_log_actions_title)
-                        )
-                    }
                     IconButton(onClick = { vm.refreshAvailability(userInitiated = true) }) {
                         Icon(
                             imageVector = Icons.Outlined.Refresh,
@@ -530,37 +466,16 @@ fun SplitApkInstallerScreen(
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
             }
 
-            Surface(
-                shape = RoundedCornerShape(14.dp),
-                tonalElevation = 1.dp,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                val logText = if (state.logEntries.isEmpty()) {
-                    stringResource(R.string.split_installer_log_empty)
-                } else {
-                    state.logEntries.joinToString(separator = "\n\n")
-                }
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 12.dp, vertical = 10.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Text(
-                        text = stringResource(R.string.split_installer_log_title),
-                        style = MaterialTheme.typography.titleSmall
-                    )
-                    Text(
-                        text = logText,
-                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(260.dp)
-                            .verticalScroll(logScrollState)
-                    )
-                }
-            }
+            SplitInstallerRawLog(
+                entries = state.logEntries,
+                logRevision = state.logRevision,
+                logSessionId = state.logSessionId,
+                scrollState = logScrollState,
+                showActions = state.logComplete &&
+                    (state.successMessage != null || state.errorMessage != null),
+                onCopy = ::copyLog,
+                onExport = ::openLogExportPicker
+            )
 
             if (!state.inProgress && !state.installedPackageName.isNullOrBlank()) {
                 Button(
@@ -579,6 +494,172 @@ fun SplitApkInstallerScreen(
                         text = stringResource(R.string.open_app),
                         modifier = Modifier.padding(start = 8.dp)
                     )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SplitInstallerRawLog(
+    entries: List<String>,
+    logRevision: Long,
+    logSessionId: Long,
+    scrollState: ScrollState,
+    showActions: Boolean,
+    onCopy: () -> Unit,
+    onExport: () -> Unit
+) {
+    var followLatest by remember(logSessionId) { mutableStateOf(true) }
+    var logExpanded by rememberSaveable(logSessionId) { mutableStateOf(true) }
+    val latestLogRevision by rememberUpdatedState(logRevision)
+    val hasLogEntries by rememberUpdatedState(entries.isNotEmpty())
+    val isLogDragged by scrollState.interactionSource.collectIsDraggedAsState()
+    val showJumpToLatest by remember(scrollState, logSessionId) {
+        derivedStateOf {
+            logExpanded &&
+                hasLogEntries &&
+                !followLatest &&
+                scrollState.canScrollForward
+        }
+    }
+
+    LaunchedEffect(scrollState, logSessionId) {
+        snapshotFlow {
+            isLogDragged to !scrollState.canScrollForward
+        }.collect { (isDragged, isAtLatest) ->
+            when {
+                isDragged -> followLatest = false
+                isAtLatest -> followLatest = true
+            }
+        }
+    }
+
+    LaunchedEffect(scrollState, logSessionId) {
+        snapshotFlow { Triple(latestLogRevision, followLatest, logExpanded) }
+            .collect { (_, shouldFollowLatest, expanded) ->
+                if (shouldFollowLatest && expanded && hasLogEntries) {
+                    withFrameNanos { }
+                    scrollState.scrollTo(scrollState.maxValue)
+                }
+            }
+    }
+
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
+        )
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(enabled = hasLogEntries) {
+                        logExpanded = !logExpanded
+                    },
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = stringResource(R.string.split_installer_log_title),
+                    style = MaterialTheme.typography.titleSmall
+                )
+                if (hasLogEntries) {
+                    Icon(
+                        imageVector = if (logExpanded) {
+                            Icons.Outlined.ExpandLess
+                        } else {
+                            Icons.Outlined.ExpandMore
+                        },
+                        contentDescription = stringResource(
+                            if (logExpanded) {
+                                R.string.collapse_content
+                            } else {
+                                R.string.expand_content
+                            }
+                        )
+                    )
+                }
+            }
+
+            AnimatedVisibility(visible = !hasLogEntries || logExpanded) {
+                Box(modifier = Modifier.fillMaxWidth()) {
+                    SelectionContainer {
+                        Text(
+                            text = if (hasLogEntries) {
+                                entries.joinToString(separator = "\n\n")
+                            } else {
+                                stringResource(R.string.split_installer_log_empty)
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 96.dp, max = 220.dp)
+                                .verticalScroll(scrollState),
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 11.sp,
+                                lineHeight = 14.sp
+                            ),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    if (showJumpToLatest) {
+                        SmallFloatingActionButton(
+                            onClick = { followLatest = true },
+                            modifier = Modifier
+                                .align(Alignment.BottomEnd)
+                                .padding(8.dp),
+                            containerColor = MaterialTheme.colorScheme.primaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.KeyboardArrowDown,
+                                contentDescription = stringResource(
+                                    R.string.split_installer_log_jump_latest
+                                ),
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
+            if (showActions && hasLogEntries) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onCopy,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.ContentCopy,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Text(
+                            text = stringResource(R.string.split_installer_log_copy),
+                            modifier = Modifier.padding(start = 8.dp)
+                        )
+                    }
+                    OutlinedButton(
+                        onClick = onExport,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.Description,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Text(
+                            text = stringResource(R.string.split_installer_log_export),
+                            modifier = Modifier.padding(start = 8.dp)
+                        )
+                    }
                 }
             }
         }

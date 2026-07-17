@@ -6,6 +6,7 @@ import android.content.ClipboardManager
 import android.content.ComponentName
 import android.graphics.drawable.Drawable
 import android.os.Build
+import android.net.Uri
 import android.view.HapticFeedbackConstants
 import androidx.annotation.StringRes
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -182,6 +183,8 @@ import app.urv.manager.ui.component.ColumnWithScrollbar
 import app.urv.manager.ui.component.CenteredDialogTitle
 import app.urv.manager.ui.component.GroupHeader
 import app.urv.manager.ui.component.SettingsSectionIcons
+import app.urv.manager.ui.component.RememberedCreateDocument
+import app.urv.manager.ui.component.toPickerDirectoryUri
 import app.urv.manager.ui.component.splitTrailingPunctuation
 import app.urv.manager.ui.component.settings.BooleanItem
 import app.urv.manager.ui.component.settings.SafeguardBooleanItem
@@ -207,6 +210,7 @@ import app.urv.manager.ui.model.PatchSelectionActionKey
 import app.urv.manager.ui.model.PatchBundleActionKey
 import app.urv.manager.ui.model.SavedAppActionKey
 import app.urv.manager.ui.model.PatchProfileActionKey
+import app.urv.manager.ui.model.LsposedModuleActionKey
 import app.urv.manager.ui.model.navigation.Settings as NavigationSettings
 import app.urv.manager.ui.screen.settings.SettingsSearchState
 import kotlinx.coroutines.Dispatchers
@@ -1008,6 +1012,20 @@ fun AdvancedSettingsScreen(
                 }
                 ExpressiveSettingsDivider()
                 SettingsSearchHighlight(
+                    targetKey = R.string.choose_split_apks_before_patching,
+                    activeKey = highlightTarget,
+                    onHighlightComplete = { highlightTarget = null }
+                ) { highlightModifier ->
+                    BooleanItem(
+                        modifier = highlightModifier,
+                        preference = viewModel.prefs.chooseSplitApksBeforePatching,
+                        coroutineScope = viewModel.viewModelScope,
+                        headline = R.string.choose_split_apks_before_patching,
+                        description = R.string.choose_split_apks_before_patching_description,
+                    )
+                }
+                ExpressiveSettingsDivider()
+                SettingsSearchHighlight(
                     targetKey = R.string.continue_on_patch_error,
                     activeKey = highlightTarget,
                     onHighlightComplete = { highlightTarget = null }
@@ -1018,6 +1036,20 @@ fun AdvancedSettingsScreen(
                         coroutineScope = viewModel.viewModelScope,
                         headline = R.string.continue_on_patch_error,
                         description = R.string.continue_on_patch_error_description,
+                    )
+                }
+                ExpressiveSettingsDivider()
+                SettingsSearchHighlight(
+                    targetKey = R.string.skip_apk_signing,
+                    activeKey = highlightTarget,
+                    onHighlightComplete = { highlightTarget = null }
+                ) { highlightModifier ->
+                    BooleanItem(
+                        modifier = highlightModifier,
+                        preference = viewModel.prefs.skipApkSigning,
+                        coroutineScope = viewModel.viewModelScope,
+                        headline = R.string.skip_apk_signing,
+                        description = R.string.skip_apk_signing_description,
                     )
                 }
                 ExpressiveSettingsDivider()
@@ -1266,42 +1298,6 @@ fun AdvancedSettingsScreen(
                         enabled = splitMergeAutoExpandExclusiveEnabled
                     )
                 }
-                ExpressiveSettingsDivider()
-                SettingsSearchHighlight(
-                    targetKey = R.string.merged_apk_name_format,
-                    activeKey = highlightTarget,
-                    onHighlightComplete = { highlightTarget = null }
-                ) { highlightModifier ->
-                    ExpressiveSettingsConfigurableItem(
-                        modifier = highlightModifier,
-                        headlineContent = stringResource(R.string.merged_apk_name_format),
-                        supportingContentSlot = {
-                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                Text(
-                                    text = stringResource(R.string.merged_apk_name_format_description),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                                Surface(
-                                    shape = RoundedCornerShape(8.dp),
-                                    color = MaterialTheme.colorScheme.surfaceColorAtElevation(1.dp)
-                                ) {
-                                    Text(
-                                        text = stringResource(R.string.export_name_format_current, mergedApkExportFormat),
-                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                        style = MaterialTheme.typography.labelMedium.copy(fontFamily = FontFamily.Monospace),
-                                        color = MaterialTheme.colorScheme.onSurface
-                                    )
-                                }
-                            }
-                        },
-                        secondaryActionLabel = stringResource(R.string.reset),
-                        onSecondaryAction = { viewModel.resetMergedApkExportFormat() },
-                        secondaryActionEnabled = mergedApkExportFormat != viewModel.prefs.mergedApkExportFormat.default,
-                        primaryActionLabel = stringResource(R.string.edit),
-                        onPrimaryAction = { showMergedApkExportFormatDialog = true }
-                    )
-                }
             }
 
             GroupHeader(
@@ -1362,6 +1358,503 @@ fun AdvancedSettingsScreen(
                     )
                 }
             }
+    val showPatchSelectionVersionTags by
+        viewModel.prefs.patchSelectionShowVersionTags.getAsState()
+    val showPatchSelectionOptionPreviews by
+        viewModel.prefs.patchSelectionShowOptionPreviews.getAsState()
+    val minimalPatchSelectionView =
+        !showPatchSelectionVersionTags && !showPatchSelectionOptionPreviews
+    var patchSelectionViewOptionsExpanded by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(highlightTarget) {
+        if (
+            highlightTarget == R.string.patch_selection_version_tags_title ||
+            highlightTarget == R.string.patch_selection_option_previews_title
+        ) {
+            patchSelectionViewOptionsExpanded = true
+        }
+    }
+    val lsposedActionOrderPref by viewModel.prefs.lsposedModuleActionOrder.getAsState()
+    val lsposedHiddenActionsPref by viewModel.prefs.lsposedModuleHiddenActions.getAsState()
+            val lsposedActionOrderList = remember(lsposedActionOrderPref) {
+                val parsed = lsposedActionOrderPref
+                    .split(',')
+                    .mapNotNull { LsposedModuleActionKey.fromStorageId(it.trim()) }
+                LsposedModuleActionKey.ensureComplete(parsed)
+            }
+            val lsposedWorkingOrder = remember(lsposedActionOrderList) {
+                lsposedActionOrderList.toMutableStateList()
+            }
+            LaunchedEffect(lsposedActionOrderList) {
+                lsposedWorkingOrder.clear()
+                lsposedWorkingOrder.addAll(lsposedActionOrderList)
+            }
+            var lsposedActionsExpanded by rememberSaveable { mutableStateOf(false) }
+
+            LaunchedEffect(lsposedActionOrderList) {
+                snapshotFlow { lsposedWorkingOrder.toList() }
+                    .distinctUntilChanged()
+                    .debounce(200)
+                    .collectLatest { order ->
+                        if (order == lsposedActionOrderList) return@collectLatest
+                        viewModel.setLsposedModuleActionOrder(order)
+                    }
+            }
+
+            LaunchedEffect(highlightTarget) {
+                if (highlightTarget == R.string.lsposed_module_action_visibility_title) {
+                    lsposedActionsExpanded = true
+                }
+            }
+
+            GroupHeader(
+                stringResource(R.string.action_buttons_patch_list_section),
+                icon = SettingsSectionIcons.ActionButtonsPatchList
+            )
+            ExpressiveSettingsCard(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)
+            ) {
+                Column {
+                    SettingsSearchHighlight(
+                targetKey = R.string.minimal_patch_selection_view_title,
+                activeKey = highlightTarget,
+                onHighlightComplete = { highlightTarget = null }
+            ) { highlightModifier ->
+                ExpressiveSettingsItem(
+                    modifier = highlightModifier,
+                    headlineContent = stringResource(R.string.minimal_patch_selection_view_title),
+                    supportingContent = stringResource(
+                        R.string.minimal_patch_selection_view_description
+                    ),
+                    trailingContent = {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            ExpressiveSettingsSwitch(
+                                checked = minimalPatchSelectionView,
+                                onCheckedChange = { enabled ->
+                                    viewModel.viewModelScope.launch {
+                                        viewModel.prefs.setMinimalPatchSelectionView(enabled)
+                                    }
+                                }
+                            )
+                            Icon(
+                                imageVector = if (patchSelectionViewOptionsExpanded) {
+                                    Icons.Outlined.KeyboardArrowUp
+                                } else {
+                                    Icons.Outlined.KeyboardArrowDown
+                                },
+                                contentDescription = null
+                            )
+                        }
+                    },
+                    onClick = {
+                        patchSelectionViewOptionsExpanded = !patchSelectionViewOptionsExpanded
+                    }
+                )
+            }
+            if (patchSelectionViewOptionsExpanded) {
+                ExpressiveSettingsDivider()
+                SettingsSearchHighlight(
+                    targetKey = R.string.patch_selection_version_tags_title,
+                    activeKey = highlightTarget,
+                    onHighlightComplete = { highlightTarget = null }
+                ) { highlightModifier ->
+                    BooleanItem(
+                        modifier = highlightModifier,
+                        value = showPatchSelectionVersionTags,
+                        onValueChange = { value ->
+                            viewModel.viewModelScope.launch {
+                                viewModel.prefs.patchSelectionShowVersionTags.update(value)
+                            }
+                        },
+                        headline = R.string.patch_selection_version_tags_title,
+                        description = R.string.patch_selection_version_tags_description,
+                        enabled = !minimalPatchSelectionView
+                    )
+                }
+                ExpressiveSettingsDivider()
+                SettingsSearchHighlight(
+                    targetKey = R.string.patch_selection_option_previews_title,
+                    activeKey = highlightTarget,
+                    onHighlightComplete = { highlightTarget = null }
+                ) { highlightModifier ->
+                    BooleanItem(
+                        modifier = highlightModifier,
+                        value = showPatchSelectionOptionPreviews,
+                        onValueChange = { value ->
+                            viewModel.viewModelScope.launch {
+                                viewModel.prefs.patchSelectionShowOptionPreviews.update(value)
+                            }
+                        },
+                        headline = R.string.patch_selection_option_previews_title,
+                        description = R.string.patch_selection_option_previews_description,
+                        enabled = !minimalPatchSelectionView
+                    )
+                }
+            }
+            ExpressiveSettingsDivider()
+            SettingsSearchHighlight(
+                targetKey = R.string.lsposed_module_action_order_title,
+                activeKey = highlightTarget,
+                onHighlightComplete = { highlightTarget = null }
+            ) { highlightModifier ->
+                ExpressiveSettingsItem(
+                    modifier = highlightModifier,
+                    headlineContent = stringResource(R.string.lsposed_module_action_order_title),
+                    supportingContent = stringResource(R.string.lsposed_module_action_order_description),
+                    trailingContent = {
+                        Icon(
+                            imageVector = if (lsposedActionsExpanded) {
+                                Icons.Outlined.KeyboardArrowUp
+                            } else {
+                                Icons.Outlined.KeyboardArrowDown
+                            },
+                            contentDescription = null
+                        )
+                    },
+                    onClick = { lsposedActionsExpanded = !lsposedActionsExpanded }
+                )
+            }
+
+            if (lsposedActionsExpanded) {
+                ExpressiveSettingsDivider()
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    val rowState = rememberLazyListState()
+                    val reorderableState = rememberReorderableLazyListState(rowState) { from, to ->
+                        lsposedWorkingOrder.add(
+                            to.index,
+                            lsposedWorkingOrder.removeAt(from.index)
+                        )
+                    }
+
+                    LsposedModuleActionPreview(
+                        order = lsposedWorkingOrder,
+                        hiddenActions = lsposedHiddenActionsPref,
+                        rowState = rowState,
+                        reorderableState = reorderableState
+                    )
+                }
+
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp)
+                ) {
+                    SettingsSearchHighlight(
+                        targetKey = R.string.lsposed_module_action_visibility_title,
+                        activeKey = highlightTarget,
+                        onHighlightComplete = { highlightTarget = null }
+                    ) { highlightModifier ->
+                        Text(
+                            text = stringResource(R.string.lsposed_module_action_visibility_title),
+                            style = MaterialTheme.typography.titleSmall,
+                            modifier = highlightModifier
+                        )
+                    }
+                    Text(
+                        text = stringResource(R.string.lsposed_module_action_visibility_description),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        LsposedModuleActionKey.values().forEach { key ->
+                            val visible = key.storageId !in lsposedHiddenActionsPref
+                            val setVisible: (Boolean) -> Unit = { isVisible ->
+                                val updated = lsposedHiddenActionsPref.toMutableSet()
+                                if (isVisible) {
+                                    updated.remove(key.storageId)
+                                } else {
+                                    updated.add(key.storageId)
+                                }
+                                viewModel.setLsposedModuleHiddenActions(updated)
+                            }
+
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .clickable { setVisible(!visible) }
+                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = stringResource(key.labelRes),
+                                    modifier = Modifier.weight(1f),
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                                ExpressiveSettingsSwitch(
+                                    checked = visible,
+                                    onCheckedChange = setVisible
+                                )
+                            }
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.End),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        TextButton(
+                            onClick = { viewModel.setLsposedModuleHiddenActions(emptySet()) }
+                        ) {
+                            Text(stringResource(R.string.lsposed_module_action_visibility_reset))
+                        }
+                        TextButton(
+                            onClick = {
+                                lsposedWorkingOrder.clear()
+                                lsposedWorkingOrder.addAll(LsposedModuleActionKey.DefaultOrder)
+                                viewModel.setLsposedModuleActionOrder(
+                                    LsposedModuleActionKey.DefaultOrder
+                                )
+                            }
+                        ) {
+                            Text(stringResource(R.string.lsposed_module_action_order_reset))
+                        }
+                    }
+                }
+            }
+        }
+        }
+        }
+
+        if (mode == AdvancedSettingsMode.ADVANCED_SYSTEM) {
+        GroupHeader(
+            stringResource(R.string.diagnostics_output_section),
+            icon = SettingsSectionIcons.DiagnosticsOutput
+        )
+        ExpressiveSettingsCard(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)
+        ) {
+                SettingsSearchHighlight(
+                    targetKey = R.string.export_name_format,
+                    activeKey = highlightTarget,
+                    onHighlightComplete = { highlightTarget = null }
+                ) { highlightModifier ->
+                    ExpressiveSettingsConfigurableItem(
+                        modifier = highlightModifier,
+                        headlineContent = stringResource(R.string.export_name_format),
+                        supportingContentSlot = {
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text(
+                                    text = stringResource(R.string.export_name_format_description),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = MaterialTheme.colorScheme.surfaceColorAtElevation(1.dp)
+                                ) {
+                                    Text(
+                                        text = stringResource(R.string.export_name_format_current, exportFormat),
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                        style = MaterialTheme.typography.labelMedium.copy(fontFamily = FontFamily.Monospace),
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                }
+                            }
+                        },
+                        secondaryActionLabel = stringResource(R.string.reset),
+                        onSecondaryAction = { viewModel.resetPatchedAppExportFormat() },
+                        secondaryActionEnabled = exportFormat != viewModel.prefs.patchedAppExportFormat.default,
+                        primaryActionLabel = stringResource(R.string.edit),
+                        onPrimaryAction = { showExportFormatDialog = true }
+                    )
+                }
+                ExpressiveSettingsDivider()
+                SettingsSearchHighlight(
+                    targetKey = R.string.merged_apk_name_format,
+                    activeKey = highlightTarget,
+                    onHighlightComplete = { highlightTarget = null }
+                ) { highlightModifier ->
+                    ExpressiveSettingsConfigurableItem(
+                        modifier = highlightModifier,
+                        headlineContent = stringResource(R.string.merged_apk_name_format),
+                        supportingContentSlot = {
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text(
+                                    text = stringResource(R.string.merged_apk_name_format_description),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = MaterialTheme.colorScheme.surfaceColorAtElevation(1.dp)
+                                ) {
+                                    Text(
+                                        text = stringResource(R.string.export_name_format_current, mergedApkExportFormat),
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                        style = MaterialTheme.typography.labelMedium.copy(fontFamily = FontFamily.Monospace),
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                }
+                            }
+                        },
+                        secondaryActionLabel = stringResource(R.string.reset),
+                        onSecondaryAction = { viewModel.resetMergedApkExportFormat() },
+                        secondaryActionEnabled = mergedApkExportFormat != viewModel.prefs.mergedApkExportFormat.default,
+                        primaryActionLabel = stringResource(R.string.edit),
+                        onPrimaryAction = { showMergedApkExportFormatDialog = true }
+                    )
+                }
+            }
+
+            val advancedLogExportDirectory by
+                viewModel.prefs.advancedLogExportLastDirectory.getAsState()
+            val exportDebugLogsLauncher = rememberLauncherForActivityResult(
+                RememberedCreateDocument("text/plain") {
+                    advancedLogExportDirectory.takeIf(String::isNotBlank)?.let(Uri::parse)
+                }
+            ) { uri ->
+                uri?.let {
+                    viewModel.viewModelScope.launch {
+                        viewModel.prefs.advancedLogExportLastDirectory.update(
+                            it.toPickerDirectoryUri().toString()
+                        )
+                    }
+                    viewModel.exportDebugLogs(it)
+                }
+            }
+            ExpressiveSettingsCard(
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)
+            ) {
+                SettingsSearchHighlight(
+                    targetKey = R.string.debug_logs_export,
+                    activeKey = highlightTarget,
+                    onHighlightComplete = { highlightTarget = null }
+                ) { highlightModifier ->
+                    ExpressiveSettingsItem(
+                        modifier = highlightModifier,
+                        headlineContent = stringResource(R.string.debug_logs_export),
+                        onClick = { exportDebugLogsLauncher.launch(viewModel.debugLogFileName) }
+                    )
+                }
+                ExpressiveSettingsDivider()
+                val clipboard = remember { context.getSystemService<ClipboardManager>()!! }
+                val deviceContent = """
+                    Version: ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})
+                    Build type: ${BuildConfig.BUILD_TYPE}
+                    Model: ${Build.MODEL}
+                    Android version: ${Build.VERSION.RELEASE} (${Build.VERSION.SDK_INT})
+                    Supported Archs: ${Build.SUPPORTED_ABIS.joinToString(", ")}
+                    Memory limit: $memoryLimit
+                """.trimIndent()
+                SettingsSearchHighlight(
+                    targetKey = R.string.about_device,
+                    activeKey = highlightTarget,
+                    onHighlightComplete = { highlightTarget = null }
+                ) { highlightModifier ->
+                    ExpressiveSettingsItem(
+                        modifier = highlightModifier.combinedClickable(
+                            onClick = { },
+                            onLongClickLabel = stringResource(R.string.copy_to_clipboard),
+                            onLongClick = {
+                                clipboard.setPrimaryClip(
+                                    ClipData.newPlainText("Device Information", deviceContent)
+                                )
+
+                                context.toast(context.getString(R.string.toast_copied_to_clipboard))
+                            }.withHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                        ),
+                        headlineContent = stringResource(R.string.about_device),
+                        supportingContent = deviceContent
+                    )
+                }
+            }
+        }
+        }
+    }
+
+}
+
+enum class AdvancedSettingsMode(
+    @StringRes val titleRes: Int,
+    val destination: NavigationSettings.Destination
+) {
+    APP_MANAGER(R.string.advanced, NavigationSettings.Advanced),
+    PATCHER(R.string.patcher_category, NavigationSettings.Patcher),
+    ADVANCED_SYSTEM(R.string.advanced_system, NavigationSettings.AdvancedSystem)
+}
+
+private enum class InstallerDialogTarget {
+    Primary,
+    Fallback
+}
+
+private data class LanguageOption(val code: String, @StringRes val labelRes: Int)
+
+@Composable
+private fun LanguageDialog(
+    options: List<LanguageOption>,
+    selectedCode: String,
+    onSelect: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(R.string.cancel))
+            }
+        },
+        title = {
+            CenteredDialogTitle(stringResource(R.string.language_dialog_title))
+        },
+        text = {
+            val scrollState = rememberScrollState()
+            Column(
+                modifier = Modifier
+                    .heightIn(max = 360.dp)
+                    .verticalScroll(scrollState)
+                    .padding(bottom = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                options.forEach { option ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable { onSelect(option.code) }
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = option.code == selectedCode,
+                            onClick = { onSelect(option.code) }
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = stringResource(option.labelRes),
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                }
+            }
+        }
+    )
+}
+
+@OptIn(FlowPreview::class)
+@Composable
+internal fun ActionButtonSettings(
+    viewModel: AdvancedSettingsViewModel,
+    highlightTarget: Int?,
+    onHighlightComplete: () -> Unit
+) {
     val actionOrderPref by viewModel.prefs.patchSelectionActionOrder.getAsState()
     val hiddenActionsPref by viewModel.prefs.patchSelectionHiddenActions.getAsState()
     val showPatchProfilesTab by viewModel.prefs.showPatchProfilesTab.getAsState()
@@ -1495,22 +1988,21 @@ fun AdvancedSettingsScreen(
                     }
             }
 
-            GroupHeader(
-                stringResource(R.string.action_buttons_patch_list_section),
-                icon = SettingsSectionIcons.ActionButtonsPatchList
-            )
-            ExpressiveSettingsCard(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)
-            ) {
-                Column {
-                    SettingsSearchHighlight(
+
+    LaunchedEffect(highlightTarget) {
+        when (highlightTarget) {
+            R.string.patch_selection_action_visibility_title -> actionsExpanded = true
+            R.string.patch_bundle_action_visibility_title -> bundleActionsExpanded = true
+            R.string.saved_app_action_visibility_title -> savedActionsExpanded = true
+            R.string.patch_profile_action_visibility_title -> profileActionsExpanded = true
+        }
+    }
+    Column {
+        ExpressiveSettingsDivider()
+        SettingsSearchHighlight(
                 targetKey = R.string.patch_selection_action_order_title,
                 activeKey = highlightTarget,
-                extraKeys = setOf(R.string.patch_selection_action_visibility_title),
-                onHighlightComplete = { highlightTarget = null }
+                onHighlightComplete = onHighlightComplete
             ) { highlightModifier ->
                 ExpressiveSettingsItem(
                     modifier = highlightModifier,
@@ -1771,10 +2263,17 @@ fun AdvancedSettingsScreen(
                                 .fillMaxWidth()
                                 .padding(horizontal = 16.dp)
                         ) {
-                            Text(
-                                text = stringResource(R.string.patch_selection_action_visibility_title),
-                                style = MaterialTheme.typography.titleSmall
-                            )
+                            SettingsSearchHighlight(
+                                targetKey = R.string.patch_selection_action_visibility_title,
+                                activeKey = highlightTarget,
+                                onHighlightComplete = onHighlightComplete
+                            ) { highlightModifier ->
+                                Text(
+                                    text = stringResource(R.string.patch_selection_action_visibility_title),
+                                    style = MaterialTheme.typography.titleSmall,
+                                    modifier = highlightModifier
+                                )
+                            }
                             Text(
                                 text = stringResource(R.string.patch_selection_action_visibility_description),
                                 style = MaterialTheme.typography.bodySmall,
@@ -1858,25 +2357,10 @@ fun AdvancedSettingsScreen(
                     }
                 }
             ExpressiveSettingsDivider()
-            SettingsSearchHighlight(
-                targetKey = R.string.patch_selection_version_tags_title,
-                activeKey = highlightTarget,
-                onHighlightComplete = { highlightTarget = null }
-            ) { highlightModifier ->
-                BooleanItem(
-                    modifier = highlightModifier,
-                    preference = viewModel.prefs.patchSelectionShowVersionTags,
-                    coroutineScope = viewModel.viewModelScope,
-                    headline = R.string.patch_selection_version_tags_title,
-                    description = R.string.patch_selection_version_tags_description
-                )
-            }
-            ExpressiveSettingsDivider()
                 SettingsSearchHighlight(
                     targetKey = R.string.patch_bundle_action_order_title,
                     activeKey = highlightTarget,
-                    extraKeys = setOf(R.string.patch_bundle_action_visibility_title),
-                    onHighlightComplete = { highlightTarget = null }
+                    onHighlightComplete = onHighlightComplete
                 ) { highlightModifier ->
                     ExpressiveSettingsItem(
                         modifier = highlightModifier,
@@ -1919,10 +2403,17 @@ fun AdvancedSettingsScreen(
                             .fillMaxWidth()
                             .padding(horizontal = 16.dp)
                     ) {
-                        Text(
-                            text = stringResource(R.string.patch_bundle_action_visibility_title),
-                            style = MaterialTheme.typography.titleSmall
-                        )
+                        SettingsSearchHighlight(
+                            targetKey = R.string.patch_bundle_action_visibility_title,
+                            activeKey = highlightTarget,
+                            onHighlightComplete = onHighlightComplete
+                        ) { highlightModifier ->
+                            Text(
+                                text = stringResource(R.string.patch_bundle_action_visibility_title),
+                                style = MaterialTheme.typography.titleSmall,
+                                modifier = highlightModifier
+                            )
+                        }
                         Text(
                             text = stringResource(R.string.patch_bundle_action_visibility_description),
                             style = MaterialTheme.typography.bodySmall,
@@ -1982,14 +2473,12 @@ fun AdvancedSettingsScreen(
                         }
                     }
                 }
-            }
 
             ExpressiveSettingsDivider()
             SettingsSearchHighlight(
                 targetKey = R.string.saved_app_action_order_title,
                 activeKey = highlightTarget,
-                extraKeys = setOf(R.string.saved_app_action_visibility_title),
-                onHighlightComplete = { highlightTarget = null }
+                onHighlightComplete = onHighlightComplete
             ) { highlightModifier ->
                 ExpressiveSettingsItem(
                     modifier = highlightModifier,
@@ -2032,10 +2521,17 @@ fun AdvancedSettingsScreen(
                         .fillMaxWidth()
                         .padding(horizontal = 16.dp)
                 ) {
-                    Text(
-                        text = stringResource(R.string.saved_app_action_visibility_title),
-                        style = MaterialTheme.typography.titleSmall
-                    )
+                    SettingsSearchHighlight(
+                        targetKey = R.string.saved_app_action_visibility_title,
+                        activeKey = highlightTarget,
+                        onHighlightComplete = onHighlightComplete
+                    ) { highlightModifier ->
+                        Text(
+                            text = stringResource(R.string.saved_app_action_visibility_title),
+                            style = MaterialTheme.typography.titleSmall,
+                            modifier = highlightModifier
+                        )
+                    }
                     Text(
                         text = stringResource(R.string.saved_app_action_visibility_description),
                         style = MaterialTheme.typography.bodySmall,
@@ -2099,8 +2595,7 @@ fun AdvancedSettingsScreen(
             SettingsSearchHighlight(
                 targetKey = R.string.patch_profile_action_order_title,
                 activeKey = highlightTarget,
-                extraKeys = setOf(R.string.patch_profile_action_visibility_title),
-                onHighlightComplete = { highlightTarget = null }
+                onHighlightComplete = onHighlightComplete
             ) { highlightModifier ->
                 ExpressiveSettingsItem(
                     modifier = highlightModifier,
@@ -2143,10 +2638,17 @@ fun AdvancedSettingsScreen(
                         .fillMaxWidth()
                         .padding(horizontal = 16.dp)
                 ) {
-                    Text(
-                        text = stringResource(R.string.patch_profile_action_visibility_title),
-                        style = MaterialTheme.typography.titleSmall
-                    )
+                    SettingsSearchHighlight(
+                        targetKey = R.string.patch_profile_action_visibility_title,
+                        activeKey = highlightTarget,
+                        onHighlightComplete = onHighlightComplete
+                    ) { highlightModifier ->
+                        Text(
+                            text = stringResource(R.string.patch_profile_action_visibility_title),
+                            style = MaterialTheme.typography.titleSmall,
+                            modifier = highlightModifier
+                        )
+                    }
                     Text(
                         text = stringResource(R.string.patch_profile_action_visibility_description),
                         style = MaterialTheme.typography.bodySmall,
@@ -2206,178 +2708,8 @@ fun AdvancedSettingsScreen(
                     }
                 }
             }
-        }
-        }
 
-        if (mode == AdvancedSettingsMode.ADVANCED_SYSTEM) {
-        GroupHeader(
-            stringResource(R.string.diagnostics_output_section),
-            icon = SettingsSectionIcons.DiagnosticsOutput
-        )
-        ExpressiveSettingsCard(
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)
-        ) {
-                SettingsSearchHighlight(
-                    targetKey = R.string.export_name_format,
-                    activeKey = highlightTarget,
-                    onHighlightComplete = { highlightTarget = null }
-                ) { highlightModifier ->
-                    ExpressiveSettingsConfigurableItem(
-                        modifier = highlightModifier,
-                        headlineContent = stringResource(R.string.export_name_format),
-                        supportingContentSlot = {
-                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                Text(
-                                    text = stringResource(R.string.export_name_format_description),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                                Surface(
-                                    shape = RoundedCornerShape(8.dp),
-                                    color = MaterialTheme.colorScheme.surfaceColorAtElevation(1.dp)
-                                ) {
-                                    Text(
-                                        text = stringResource(R.string.export_name_format_current, exportFormat),
-                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                        style = MaterialTheme.typography.labelMedium.copy(fontFamily = FontFamily.Monospace),
-                                        color = MaterialTheme.colorScheme.onSurface
-                                    )
-                                }
-                            }
-                        },
-                        secondaryActionLabel = stringResource(R.string.reset),
-                        onSecondaryAction = { viewModel.resetPatchedAppExportFormat() },
-                        secondaryActionEnabled = exportFormat != viewModel.prefs.patchedAppExportFormat.default,
-                        primaryActionLabel = stringResource(R.string.edit),
-                        onPrimaryAction = { showExportFormatDialog = true }
-                    )
-                }
-            }
-
-            val exportDebugLogsLauncher =
-                rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) {
-                    it?.let(viewModel::exportDebugLogs)
-                }
-            ExpressiveSettingsCard(
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)
-            ) {
-                SettingsSearchHighlight(
-                    targetKey = R.string.debug_logs_export,
-                    activeKey = highlightTarget,
-                    onHighlightComplete = { highlightTarget = null }
-                ) { highlightModifier ->
-                    ExpressiveSettingsItem(
-                        modifier = highlightModifier,
-                        headlineContent = stringResource(R.string.debug_logs_export),
-                        onClick = { exportDebugLogsLauncher.launch(viewModel.debugLogFileName) }
-                    )
-                }
-                ExpressiveSettingsDivider()
-                val clipboard = remember { context.getSystemService<ClipboardManager>()!! }
-                val deviceContent = """
-                    Version: ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})
-                    Build type: ${BuildConfig.BUILD_TYPE}
-                    Model: ${Build.MODEL}
-                    Android version: ${Build.VERSION.RELEASE} (${Build.VERSION.SDK_INT})
-                    Supported Archs: ${Build.SUPPORTED_ABIS.joinToString(", ")}
-                    Memory limit: $memoryLimit
-                """.trimIndent()
-                SettingsSearchHighlight(
-                    targetKey = R.string.about_device,
-                    activeKey = highlightTarget,
-                    onHighlightComplete = { highlightTarget = null }
-                ) { highlightModifier ->
-                    ExpressiveSettingsItem(
-                        modifier = highlightModifier.combinedClickable(
-                            onClick = { },
-                            onLongClickLabel = stringResource(R.string.copy_to_clipboard),
-                            onLongClick = {
-                                clipboard.setPrimaryClip(
-                                    ClipData.newPlainText("Device Information", deviceContent)
-                                )
-
-                                context.toast(context.getString(R.string.toast_copied_to_clipboard))
-                            }.withHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-                        ),
-                        headlineContent = stringResource(R.string.about_device),
-                        supportingContent = deviceContent
-                    )
-                }
-            }
-        }
-        }
     }
-
-}
-
-enum class AdvancedSettingsMode(
-    @StringRes val titleRes: Int,
-    val destination: NavigationSettings.Destination
-) {
-    APP_MANAGER(R.string.advanced, NavigationSettings.Advanced),
-    PATCHER(R.string.patcher_category, NavigationSettings.Patcher),
-    ADVANCED_SYSTEM(R.string.advanced_system, NavigationSettings.AdvancedSystem)
-}
-
-private enum class InstallerDialogTarget {
-    Primary,
-    Fallback
-}
-
-private data class LanguageOption(val code: String, @StringRes val labelRes: Int)
-
-@Composable
-private fun LanguageDialog(
-    options: List<LanguageOption>,
-    selectedCode: String,
-    onSelect: (String) -> Unit,
-    onDismiss: () -> Unit
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = {
-            TextButton(onClick = onDismiss) {
-                Text(stringResource(R.string.cancel))
-            }
-        },
-        title = {
-            CenteredDialogTitle(stringResource(R.string.language_dialog_title))
-        },
-        text = {
-            val scrollState = rememberScrollState()
-            Column(
-                modifier = Modifier
-                    .heightIn(max = 360.dp)
-                    .verticalScroll(scrollState)
-                    .padding(bottom = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(2.dp)
-            ) {
-                options.forEach { option ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(12.dp))
-                            .clickable { onSelect(option.code) }
-                            .padding(horizontal = 8.dp, vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        RadioButton(
-                            selected = option.code == selectedCode,
-                            onClick = { onSelect(option.code) }
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = stringResource(option.labelRes),
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                    }
-                }
-            }
-        }
-    )
 }
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -2923,6 +3255,111 @@ private fun PatchProfileActionPreviewRow(
     }
 }
 
+@Composable
+private fun LsposedModuleActionPreview(
+    order: List<LsposedModuleActionKey>,
+    hiddenActions: Set<String> = emptySet(),
+    modifier: Modifier = Modifier,
+    rowState: LazyListState = rememberLazyListState(),
+    reorderableState: sh.calvin.reorderable.ReorderableLazyListState
+) {
+    val density = LocalDensity.current
+    val glowRadiusPx = remember(density) { with(density) { 200.dp.toPx() } }
+
+    Box(
+        modifier = modifier.fillMaxWidth(),
+        contentAlignment = Alignment.Center
+    ) {
+        Surface(
+            shape = RoundedCornerShape(18.dp),
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.55f),
+            tonalElevation = 0.dp,
+            shadowElevation = 6.dp,
+            border = BorderStroke(
+                1.dp,
+                MaterialTheme.colorScheme.outline.copy(alpha = 0.14f)
+            ),
+            modifier = Modifier.widthIn(max = 520.dp)
+        ) {
+            Box {
+                Box(
+                    modifier = Modifier
+                        .matchParentSize()
+                        .blur(26.dp)
+                        .background(
+                            Brush.radialGradient(
+                                colors = listOf(
+                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
+                                    Color.Transparent
+                                ),
+                                radius = glowRadiusPx
+                            )
+                        )
+                )
+                Box(
+                    modifier = Modifier
+                        .matchParentSize()
+                        .background(
+                            MaterialTheme.colorScheme.surface.copy(alpha = 0.16f)
+                        )
+                )
+
+                Column(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalAlignment = Alignment.End
+                ) {
+                    LsposedModuleActionPreviewRow(
+                        keys = order,
+                        hiddenActions = hiddenActions,
+                        state = rowState,
+                        reorderableState = reorderableState
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LsposedModuleActionPreviewRow(
+    keys: List<LsposedModuleActionKey>,
+    hiddenActions: Set<String>,
+    state: LazyListState,
+    reorderableState: sh.calvin.reorderable.ReorderableLazyListState
+) {
+    LazyRow(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(48.dp),
+        state = state,
+        contentPadding = PaddingValues(horizontal = 4.dp)
+    ) {
+        items(
+            items = keys,
+            key = { key -> key.storageId }
+        ) { key ->
+            ReorderableItem(reorderableState, key = key.storageId) { isDragging ->
+                Box(
+                    modifier = Modifier
+                        .fillParentMaxHeight()
+                        .padding(horizontal = 6.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    SelectionActionPreviewChip(
+                        icon = previewIconForLsposedModuleAction(key),
+                        label = stringResource(key.labelRes),
+                        dragging = isDragging,
+                        ghost = isDragging,
+                        hidden = key.storageId in hiddenActions,
+                        modifier = Modifier.longPressDraggableHandle()
+                    )
+                }
+            }
+        }
+    }
+}
+
 private fun previewIconForBundleAction(key: PatchBundleActionKey): ImageVector =
     when (key) {
         PatchBundleActionKey.EDIT -> Icons.Outlined.Edit
@@ -2949,6 +3386,17 @@ private fun previewIconForProfileAction(key: PatchProfileActionKey): ImageVector
         PatchProfileActionKey.VIEW_PATCHES -> Icons.Outlined.Extension
         PatchProfileActionKey.SETTINGS -> Icons.Outlined.Settings
     }
+
+private fun previewIconForLsposedModuleAction(
+    key: LsposedModuleActionKey
+): ImageVector = when (key) {
+    LsposedModuleActionKey.MANAGER -> Icons.AutoMirrored.Outlined.OpenInNew
+    LsposedModuleActionKey.SETTINGS -> Icons.Outlined.Settings
+    LsposedModuleActionKey.UPDATE -> Icons.Outlined.Update
+    LsposedModuleActionKey.REINSTALL -> Icons.Outlined.InstallMobile
+    LsposedModuleActionKey.UNINSTALL -> Icons.Outlined.Delete
+    LsposedModuleActionKey.FORGET -> Icons.Outlined.Block
+}
 
 @Composable
 private fun ExportNameFormatDialog(

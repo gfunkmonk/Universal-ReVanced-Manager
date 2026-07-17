@@ -1,5 +1,6 @@
 package app.urv.manager.network.api
 
+import android.net.Uri
 import android.os.Build
 import app.urv.manager.domain.manager.PreferencesManager
 import app.urv.manager.network.dto.*
@@ -259,7 +260,8 @@ class ReVancedAPI(
 
     suspend fun getLatestAppInfo(): APIResponse<ReVancedAsset> {
         val config = repoConfig()
-        val includePrerelease = prefs.useManagerPrereleases.get()
+        val includePrerelease =
+            prefs.useManagerPrereleasesForVersion(BuildConfig.VERSION_NAME)
         return fetchReleaseAsset(config, includePrerelease, ::isManagerAsset, ::pickManagerAsset)
     }
 
@@ -330,6 +332,15 @@ class ReVancedAPI(
         }
 
         return APIResponse.Success(releases.take(targetLimit))
+    }
+
+    suspend fun getRepositoryReleaseByTag(
+        repoUrl: String,
+        tag: String,
+    ): APIResponse<GitHubRelease> {
+        val config = runCatching { parseRepoUrl(repoUrl) }
+            .getOrElse { return APIResponse.Failure(APIFailure(it, null)) }
+        return githubRequest(config, "releases/tags/${Uri.encode(tag)}")
     }
 
     suspend fun getContributors(): APIResponse<List<ReVancedGitRepository>> {

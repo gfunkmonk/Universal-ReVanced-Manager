@@ -71,6 +71,7 @@ import androidx.compose.material.icons.outlined.BugReport
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Download
+import androidx.compose.material.icons.outlined.DeviceHub
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Notifications
 import androidx.compose.material.icons.outlined.Refresh
@@ -158,6 +159,7 @@ import app.urv.manager.ui.component.AlertDialogExtended
 import app.urv.manager.ui.component.AppIcon
 import app.urv.manager.ui.component.AppLabel
 import app.urv.manager.ui.component.AppTopBar
+import app.urv.manager.ui.component.AppVersion
 import app.urv.manager.ui.component.AutoUpdatesDialog
 import app.urv.manager.ui.component.AvailableUpdateDialog
 import app.urv.manager.ui.component.CheckedFilterChip
@@ -176,12 +178,17 @@ import app.urv.manager.ui.component.bundle.ImportPatchBundleDialog
 import app.urv.manager.ui.component.haptics.HapticFloatingActionButton
 import app.urv.manager.ui.component.haptics.HapticTab
 import app.urv.manager.ui.component.patches.PathSelectorDialog
+import app.urv.manager.ui.component.RememberedCreateDocument
+import app.urv.manager.ui.component.RememberedGetContent
+import app.urv.manager.ui.component.RememberedOpenDocumentTree
+import app.urv.manager.ui.component.toPickerDirectoryUri
 import app.urv.manager.ui.component.patcher.InstallerPickerDialog
 import app.urv.manager.ui.component.patcher.SavedAppMountPromptDialog
 import app.urv.manager.ui.component.patcher.SavedAppMountPromptMode
 import app.urv.manager.ui.viewmodel.DashboardViewModel
 import app.urv.manager.ui.viewmodel.InstalledAppInfoViewModel
 import app.urv.manager.ui.viewmodel.MainViewModel
+import app.urv.manager.ui.viewmodel.LsposedViewModel
 import app.urv.manager.ui.model.SelectedApp
 import app.urv.manager.ui.viewmodel.PatchProfileLaunchData
 import app.urv.manager.ui.viewmodel.PatchProfilesViewModel
@@ -224,6 +231,7 @@ import org.koin.compose.koinInject
 import org.koin.core.parameter.parametersOf
 import kotlin.math.abs
 import app.urv.manager.ui.component.CenteredDialogTitle
+import app.urv.manager.ui.screen.dashboard.LsposedTabScreen
 
 enum class DashboardPage(
     val titleResId: Int,
@@ -232,6 +240,7 @@ enum class DashboardPage(
     DASHBOARD(R.string.tab_apps, Icons.Outlined.Apps),
     BUNDLES(R.string.tab_patches, Icons.Outlined.Source),
     PROFILES(R.string.tab_profiles, Icons.Outlined.Bookmarks),
+    LSPOSED(R.string.tab_lsposed, Icons.Outlined.DeviceHub),
     TOOLS(R.string.tab_tools, Icons.Outlined.Build),
 }
 
@@ -288,13 +297,28 @@ fun DashboardScreen(
     val disableMainTabSwipe by prefs.disableMainTabSwipe.getAsState()
     val preventAccidentalTouching by prefs.preventAccidentalTouching.getAsState()
     val showPatchProfilesTab by prefs.showPatchProfilesTab.getAsState()
+    val showLsposedTab by prefs.showLsposedTab.getAsState()
+    val lsposedViewModel = if (showLsposedTab) {
+        koinViewModel<LsposedViewModel>()
+    } else {
+        null
+    }
+    val lsposedRootAvailable = lsposedViewModel?.frameworkState?.rootAvailable == true
     val showToolsTab by prefs.showToolsTab.getAsState()
     val announcementSystemEnabled by prefs.announcementSystemEnabled.getAsState()
     val exportFormat by prefs.patchedAppExportFormat.getAsState()
+    val dashboardApkInputDirectory by prefs.dashboardApkInputLastDirectory.getAsState()
+    val dashboardQuickExportDirectory by prefs.dashboardQuickExportLastDirectory.getAsState()
+    val dashboardBundleInputDirectory by prefs.dashboardBundleInputLastDirectory.getAsState()
+    val dashboardSplitInputDirectory by prefs.dashboardSplitInputLastDirectory.getAsState()
+    val dashboardSavedAppsExportDirectory by
+        prefs.dashboardSavedAppsExportLastDirectory.getAsState()
     val chooseInstallerPerInstall by prefs.chooseInstallerPerInstall.getAsState()
     val bundlesFabCollapsed by prefs.dashboardBundlesFabCollapsed.getAsState()
     val appsFabCollapsed by prefs.dashboardAppsFabCollapsed.getAsState()
-    val progressBannerCollapsed by prefs.dashboardProgressBannerCollapsed.getAsState()
+    val lsposedFabCollapsed by prefs.dashboardLsposedFabCollapsed.getAsState()
+    val bundleImportBannerCollapsed by prefs.dashboardBundleImportBannerCollapsed.getAsState()
+    val bundleUpdateBannerCollapsed by prefs.dashboardBundleUpdateBannerCollapsed.getAsState()
     val installerManager: InstallerManager = koinInject()
     val bundlesSelectable by remember { derivedStateOf { selectedSourceCount > 0 } }
     val selectedProfileCount by remember { derivedStateOf { patchProfilesViewModel.selectedProfiles.size } }
@@ -318,6 +342,7 @@ fun DashboardScreen(
         onStorageSelect(selected)
     }
     var showStorageDialog by rememberSaveable { mutableStateOf(false) }
+    val pickerScope = rememberCoroutineScope()
     val (permissionContract, permissionName) = remember { fs.permissionContract() }
     val permissionLauncher =
         rememberLauncherForActivityResult(permissionContract) { granted ->
@@ -326,9 +351,14 @@ fun DashboardScreen(
             }
         }
     val openStorageDocumentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
+        contract = RememberedGetContent {
+            dashboardApkInputDirectory.takeIf(String::isNotBlank)?.let(Uri::parse)
+        }
     ) { uri ->
         if (uri != null) {
+            pickerScope.launch {
+                prefs.dashboardApkInputLastDirectory.update(uri.toPickerDirectoryUri().toString())
+            }
             storageVm.handleStorageResult(uri)
         }
     }
@@ -361,10 +391,11 @@ fun DashboardScreen(
     var showBundleOrderDialog by rememberSaveable { mutableStateOf(false) }
     var showAppsOrderDialog by rememberSaveable { mutableStateOf(false) }
     var showProfilesOrderDialog by rememberSaveable { mutableStateOf(false) }
-    val visibleTabs = remember(showPatchProfilesTab, showToolsTab) {
+    val visibleTabs = remember(showPatchProfilesTab, showLsposedTab, showToolsTab) {
         DashboardPage.entries.filter { page ->
             when (page) {
                 DashboardPage.PROFILES -> showPatchProfilesTab
+                DashboardPage.LSPOSED -> showLsposedTab
                 DashboardPage.TOOLS -> showToolsTab
                 else -> true
             }
@@ -434,7 +465,7 @@ fun DashboardScreen(
                 suppressProfilesSelectionTopBar = false
             }
 
-            DashboardPage.TOOLS -> Unit
+            DashboardPage.LSPOSED, DashboardPage.TOOLS -> Unit
         }
     }
     fun closeDashboardSearch() {
@@ -504,7 +535,7 @@ fun DashboardScreen(
                 DashboardPage.DASHBOARD -> suppressAppsSelectionTopBar = false
                 DashboardPage.BUNDLES -> suppressBundlesSelectionTopBar = false
                 DashboardPage.PROFILES -> suppressProfilesSelectionTopBar = false
-                DashboardPage.TOOLS -> Unit
+                DashboardPage.LSPOSED, DashboardPage.TOOLS -> Unit
             }
         }
     }
@@ -547,7 +578,7 @@ fun DashboardScreen(
                 }
             }
 
-            DashboardPage.TOOLS -> {
+            DashboardPage.LSPOSED, DashboardPage.TOOLS -> {
                 composableScope.launch {
                     scrollToVisiblePage(previousVisibleTab(currentPage), animated = true)
                 }
@@ -562,10 +593,17 @@ fun DashboardScreen(
         koinViewModel<InstalledAppInfoViewModel>(key = "quick-action-$pkg") { parametersOf(pkg) }
     }
     val lifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner, installedAppsViewModel, announcementSystemEnabled, vm) {
+    DisposableEffect(
+        lifecycleOwner,
+        installedAppsViewModel,
+        announcementSystemEnabled,
+        vm,
+        lsposedViewModel,
+    ) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 installedAppsViewModel.refreshDeviceAndMountState()
+                lsposedViewModel?.checkRootAccess()
                 if (announcementSystemEnabled) {
                     vm.refreshAnnouncements(forceRefresh = true)
                 }
@@ -637,6 +675,7 @@ fun DashboardScreen(
     var selectedBundlePath by rememberSaveable { mutableStateOf<String?>(null) }
     var selectedBundleUri by remember { mutableStateOf<Uri?>(null) }
     var showAddBundleDialog by rememberSaveable { mutableStateOf(false) }
+    var showAddLsposedDialog by rememberSaveable { mutableStateOf(false) }
     var initialAddBundleRemoteUrl by rememberSaveable { mutableStateOf("") }
     val (bundlePermissionContract, bundlePermissionName) = remember { fs.permissionContract() }
     val bundlePermissionLauncher =
@@ -646,9 +685,14 @@ fun DashboardScreen(
             }
         }
     val bundleDocumentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
+        contract = RememberedGetContent {
+            dashboardBundleInputDirectory.takeIf(String::isNotBlank)?.let(Uri::parse)
+        }
     ) { uri ->
         if (uri != null) {
+            composableScope.launch {
+                prefs.dashboardBundleInputLastDirectory.update(uri.toPickerDirectoryUri().toString())
+            }
             selectedBundleUri = uri
             val displayName = runCatching {
                 androidContext.contentResolver.query(
@@ -727,9 +771,14 @@ fun DashboardScreen(
             pendingSplitPermissionRequest = null
         }
     val splitInputDocumentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
+        contract = RememberedGetContent {
+            dashboardSplitInputDirectory.takeIf(String::isNotBlank)?.let(Uri::parse)
+        }
     ) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
+        composableScope.launch {
+            prefs.dashboardSplitInputLastDirectory.update(uri.toPickerDirectoryUri().toString())
+        }
         val displayName = runCatching {
             androidContext.contentResolver.query(
                 uri,
@@ -790,9 +839,14 @@ fun DashboardScreen(
             }
         }
     val savedAppsExportTreeLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocumentTree()
+        contract = RememberedOpenDocumentTree {
+            dashboardSavedAppsExportDirectory.takeIf(String::isNotBlank)?.let(Uri::parse)
+        }
     ) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
+        composableScope.launch {
+            prefs.dashboardSavedAppsExportLastDirectory.update(uri.toString())
+        }
         savedAppsExportInProgress = true
         installedAppsViewModel.exportSelectedSavedAppsToTreeUri(
             context = androidContext,
@@ -857,10 +911,15 @@ fun DashboardScreen(
         return ExportNameFormatter.format(exportFormat, exportData)
     }
     val quickExportDocumentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.CreateDocument("application/vnd.android.package-archive")
+        contract = RememberedCreateDocument("application/vnd.android.package-archive") {
+            dashboardQuickExportDirectory.takeIf(String::isNotBlank)?.let(Uri::parse)
+        }
     ) { uri ->
         val viewModel = quickActionViewModel
         if (uri != null && viewModel != null) {
+            composableScope.launch {
+                prefs.dashboardQuickExportLastDirectory.update(uri.toPickerDirectoryUri().toString())
+            }
             viewModel.exportSavedApp(uri)
         }
         showQuickExportPicker = false
@@ -905,6 +964,7 @@ fun DashboardScreen(
                 bundleImportProgress?.let { progress ->
                     val context = LocalContext.current
                     val total = progress.total.coerceAtLeast(1)
+                    val bundleCount = progress.bundleCount.coerceAtLeast(1)
                     val collapsedCount = if (progress.isStepBased) {
                         (progress.processed + 1).coerceIn(1, total)
                     } else {
@@ -955,18 +1015,24 @@ fun DashboardScreen(
                         add(detail)
                     }
                     DownloadProgressBanner(
-                        title = stringResource(R.string.import_patch_bundles_banner_title),
+                        title = pluralStringResource(
+                            R.plurals.import_patch_bundles_banner_title_quantity,
+                            bundleCount
+                        ),
                         subtitle = subtitleParts.joinToString(" - "),
                         progress = progress.ratio,
-                        collapsedLabel = stringResource(
-                            R.string.import_patch_bundles_banner_collapsed,
+                        collapsedLabel = pluralStringResource(
+                            R.plurals.import_patch_bundles_banner_collapsed_quantity,
+                            bundleCount,
                             collapsedCount,
                             total
                         ),
-                        collapsed = progressBannerCollapsed,
+                        collapsed = bundleImportBannerCollapsed,
                         onToggleCollapsed = {
                             composableScope.launch {
-                                prefs.dashboardProgressBannerCollapsed.update(!progressBannerCollapsed)
+                                prefs.dashboardBundleImportBannerCollapsed.update(
+                                    !bundleImportBannerCollapsed
+                                )
                             }
                         },
                         modifier = Modifier
@@ -1055,10 +1121,12 @@ fun DashboardScreen(
                             progress.completed.coerceAtMost(progress.total),
                             progress.total
                         ),
-                        collapsed = progressBannerCollapsed,
+                        collapsed = bundleUpdateBannerCollapsed,
                         onToggleCollapsed = {
                             composableScope.launch {
-                                prefs.dashboardProgressBannerCollapsed.update(!progressBannerCollapsed)
+                                prefs.dashboardBundleUpdateBannerCollapsed.update(
+                                    !bundleUpdateBannerCollapsed
+                                )
                             }
                         },
                         modifier = Modifier
@@ -1233,7 +1301,8 @@ fun DashboardScreen(
                 path?.let { storageVm.handleStorageFile(File(it.toString())) }
             },
             fileFilter = ::isAllowedApkFile,
-            allowDirectorySelection = false
+            allowDirectorySelection = false,
+            lastDirectoryPreference = prefs.dashboardApkInputLastDirectory
         )
     }
     storageVm.universalFallbackDialogSubject?.let {
@@ -1247,6 +1316,7 @@ fun DashboardScreen(
             suggestedVersion = storageVm.nonSuggestedVersionDialogSuggestedVersion
                 ?.takeUnless { it.isBlank() }
                 ?: storageSuggestedVersions[local.packageName].orEmpty().ifBlank { local.version },
+            suggestedVersionCodes = storageVm.nonSuggestedVersionDialogSuggestedVersionCodes,
             requiresUniversalPatchesEnabled = storageVm.nonSuggestedVersionDialogRequiresUniversalEnabled,
             onDismiss = storageVm::dismissNonSuggestedVersionDialog
         )
@@ -1260,7 +1330,8 @@ fun DashboardScreen(
                 path?.let { selectedBundlePath = it.toString() }
             },
             fileFilter = ::isAllowedPatchBundleFile,
-            allowDirectorySelection = false
+            allowDirectorySelection = false,
+            lastDirectoryPreference = prefs.dashboardBundleInputLastDirectory
         )
     }
     if (showSplitSourceDialog) {
@@ -1332,7 +1403,8 @@ fun DashboardScreen(
                 vm.startSplitMergeFromPath(path.toString())
             },
             fileFilter = ::isAllowedSplitArchiveFile,
-            allowDirectorySelection = false
+            allowDirectorySelection = false,
+            lastDirectoryPreference = prefs.dashboardSplitInputLastDirectory
         )
     }
     if (showSplitMergeLoading) {
@@ -1386,7 +1458,8 @@ fun DashboardScreen(
                         )
                     }
                 }
-            }
+            },
+            lastDirectoryPreference = prefs.dashboardSavedAppsExportLastDirectory
         )
     }
     if (savedAppsExportInProgress) {
@@ -1588,7 +1661,8 @@ fun DashboardScreen(
             onConfirm = { directory ->
                 val exportName = resolveQuickExportName(quickExportApp)
                 quickExportDialogState = QuickExportDialogState(directory, exportName)
-            }
+            },
+            lastDirectoryPreference = prefs.dashboardQuickExportLastDirectory
         )
     }
     LaunchedEffect(showQuickExportPicker, quickExportApp?.currentPackageName, useCustomFilePicker) {
@@ -1856,7 +1930,13 @@ fun DashboardScreen(
 
     Box(modifier = Modifier.fillMaxSize()) {
         Scaffold(
-            modifier = Modifier.blur(if (splitMergeDownloadLoading) 16.dp else 0.dp),
+            modifier = Modifier.blur(
+                if (splitMergeDownloadLoading || lsposedViewModel?.busyMessage != null) {
+                    16.dp
+                } else {
+                    0.dp
+                }
+            ),
             topBar = {
                 when {
                 appsSelectionActive &&
@@ -2260,6 +2340,68 @@ fun DashboardScreen(
                     }
                 }
 
+                DashboardPage.LSPOSED -> {
+                    val enterExitSpec = tween<IntOffset>(
+                        durationMillis = 220,
+                        easing = FastOutSlowInEasing,
+                    )
+                    val sizeSpec = tween<IntSize>(
+                        durationMillis = 220,
+                        easing = FastOutSlowInEasing,
+                    )
+                    Row(
+                        modifier = Modifier
+                            .height(56.dp)
+                            .offset(x = 16.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        AnimatedVisibility(
+                            visible = !lsposedFabCollapsed,
+                            enter = fadeIn(animationSpec = tween(180)) +
+                                expandHorizontally(
+                                    expandFrom = Alignment.End,
+                                    animationSpec = sizeSpec,
+                                ) +
+                                slideInHorizontally(
+                                    initialOffsetX = { it / 2 },
+                                    animationSpec = enterExitSpec,
+                                ),
+                            exit = fadeOut(animationSpec = tween(180)) +
+                                shrinkHorizontally(
+                                    shrinkTowards = Alignment.End,
+                                    animationSpec = sizeSpec,
+                                ) +
+                                slideOutHorizontally(
+                                    targetOffsetX = { it / 2 },
+                                    animationSpec = enterExitSpec,
+                                ),
+                        ) {
+                            HapticFloatingActionButton(
+                                onClick = { showAddLsposedDialog = true },
+                                enabled = lsposedRootAvailable,
+                                containerColor = if (lsposedRootAvailable) {
+                                    FloatingActionButtonDefaults.containerColor
+                                } else {
+                                    disabledAppInputFabColor
+                                },
+                            ) {
+                                Icon(Icons.Default.Add, stringResource(R.string.add))
+                            }
+                        }
+                        BundleFabHandle(
+                            collapsed = lsposedFabCollapsed,
+                            onToggle = {
+                                composableScope.launch {
+                                    prefs.dashboardLsposedFabCollapsed.update(
+                                        !lsposedFabCollapsed
+                                    )
+                                }
+                            },
+                        )
+                    }
+                }
+
                 else -> Unit
             }
         }
@@ -2580,6 +2722,14 @@ fun DashboardScreen(
                             )
                         }
 
+                        DashboardPage.LSPOSED -> lsposedViewModel?.let { viewModel ->
+                            LsposedTabScreen(
+                                showAddDialog = showAddLsposedDialog,
+                                onAddDialogDismiss = { showAddLsposedDialog = false },
+                                viewModel = viewModel,
+                            )
+                        }
+
                         DashboardPage.TOOLS -> {
                             ToolsTabScreen(
                                 onOpenMergeScreen = ::launchSplitMerge,
@@ -2804,12 +2954,12 @@ private fun ToolsTabScreen(
                     verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     Text(
-                        text = stringResource(R.string.tools_apk_signer_title),
+                        text = stringResource(R.string.tools_apk_signature_tools_title),
                         style = MaterialTheme.typography.titleMedium
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = stringResource(R.string.tools_apk_signer_description),
+                        text = stringResource(R.string.tools_apk_signature_tools_description),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -3220,15 +3370,7 @@ private fun MergeSplitInstalledAppCard(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
-                    packageInfo.versionName?.takeIf { it.isNotBlank() }?.let { versionName ->
-                        Text(
-                            text = versionName,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
+                    AppVersion(packageInfo)
                 }
             }
             Row(
@@ -3396,6 +3538,7 @@ private fun DashboardTabLabel(
         letterSpacing = 0.sp,
         fontSize = 10.sp
     )
+    val isSingleWord = text.none { it.isWhitespace() }
     if (selected) {
         Surface(
             shape = RoundedCornerShape(999.dp),
@@ -3405,10 +3548,14 @@ private fun DashboardTabLabel(
                 text = text,
                 modifier = Modifier
                     .widthIn(min = 56.dp, max = 88.dp)
-                    .padding(horizontal = 6.dp, vertical = 3.dp),
+                    .padding(
+                        horizontal = if (isSingleWord) 3.dp else 6.dp,
+                        vertical = 3.dp,
+                    ),
                 style = compactTabLabelStyle,
                 color = MaterialTheme.colorScheme.onPrimaryContainer,
-                maxLines = 2,
+                maxLines = if (isSingleWord) 1 else 2,
+                softWrap = !isSingleWord,
                 textAlign = TextAlign.Center,
                 overflow = TextOverflow.Ellipsis
             )
@@ -3418,7 +3565,8 @@ private fun DashboardTabLabel(
             text = text,
             modifier = Modifier.widthIn(min = 56.dp, max = 88.dp),
             style = compactTabLabelStyle,
-            maxLines = 2,
+            maxLines = if (isSingleWord) 1 else 2,
+            softWrap = !isSingleWord,
             textAlign = TextAlign.Center,
             overflow = TextOverflow.Ellipsis
         )

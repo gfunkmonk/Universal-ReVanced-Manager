@@ -44,6 +44,7 @@ import app.urv.manager.patcher.patch.PatchBundleType
 import app.urv.manager.patcher.runtime.morphe.MorpheRuntimeAssets
 import app.urv.manager.patcher.runtime.revanced.Revanced21RuntimeAssets
 import app.urv.manager.patcher.runtime.revanced.Revanced22RuntimeAssets
+import app.urv.manager.util.DownloadProgressNotifier
 import app.urv.manager.util.PatchSelection
 import app.urv.manager.util.Options
 import app.urv.manager.util.simpleMessage
@@ -99,6 +100,7 @@ class PatchBundleRepository(
     private val app: Application,
     private val networkInfo: NetworkInfo,
     private val prefs: PreferencesManager,
+    private val downloadProgressNotifier: DownloadProgressNotifier,
     db: AppDatabase,
 ) {
     private val dao = db.patchBundleDao()
@@ -174,11 +176,16 @@ class PatchBundleRepository(
         }
     }
 
-    fun scopedBundleInfoFlow(packageName: String, version: String?) = enabledBundlesInfoFlow.map {
+    fun scopedBundleInfoFlow(
+        packageName: String,
+        version: String?,
+        versionCode: Long? = null
+    ) = enabledBundlesInfoFlow.map {
         it.map { (_, bundleInfo) ->
             bundleInfo.forPackage(
                 packageName,
-                version
+                version,
+                versionCode
             )
         }
     }
@@ -249,6 +256,8 @@ class PatchBundleRepository(
     private var localImportProcessedSteps = 0
     @Volatile
     private var localImportTotalSteps = 0
+    @Volatile
+    private var localImportTotalBundles = 0
 
     private var bundleImportAutoClearJob: Job? = null
     private var bundleUpdateAutoClearJob: Job? = null
@@ -366,12 +375,15 @@ class PatchBundleRepository(
         localImportStateMutex.withLock {
             localImportQueued += 1
             localImportTotalSteps += LOCAL_IMPORT_STEPS
+            localImportTotalBundles += 1
             val total = localImportTotalSteps
+            val bundleCount = localImportTotalBundles
             bundleImportProgressFlow.update { progress ->
                 if (progress?.isStepBased != true) return@update progress
                 progress.copy(
                     total = total,
-                    processed = progress.processed.coerceAtMost(total)
+                    processed = progress.processed.coerceAtMost(total),
+                    bundleCount = bundleCount
                 )
             }
         }
@@ -384,6 +396,7 @@ class PatchBundleRepository(
             if (localImportQueued == 0 && localImportProcessedSteps >= localImportTotalSteps) {
                 localImportProcessedSteps = 0
                 localImportTotalSteps = 0
+                localImportTotalBundles = 0
             }
         }
     }
@@ -391,6 +404,8 @@ class PatchBundleRepository(
     private fun localImportBaseSteps(): Int = localImportProcessedSteps
 
     private fun localImportTotalSteps(): Int = localImportTotalSteps.coerceAtLeast(LOCAL_IMPORT_STEPS)
+
+    private fun localImportBundleCount(): Int = localImportTotalBundles.coerceAtLeast(1)
 
     private fun changelogHistoryFile(uid: Int): File =
         directoryOf(uid).resolve("changelog_history.json")
@@ -625,6 +640,7 @@ class PatchBundleRepository(
             ImportProgress(
                 processed = processed,
                 total = total,
+                bundleCount = localImportBundleCount(),
                 currentBundleName = displayName?.takeIf { it.isNotBlank() },
                 phase = phase,
                 bytesRead = bytesRead,
@@ -1279,9 +1295,13 @@ class PatchBundleRepository(
         return metadata
     }
 
-    suspend fun findBestBundleVersionMatch(packageName: String, version: String?): BundleVersionMatch? =
+    suspend fun findBestBundleVersionMatch(
+        packageName: String,
+        version: String?,
+        versionCode: Long? = null
+    ): BundleVersionMatch? =
         withContext(Dispatchers.Default) {
-            val scopedBundles = scopedBundleInfoFlow(packageName, version).first()
+            val scopedBundles = scopedBundleInfoFlow(packageName, version, versionCode).first()
             if (scopedBundles.isEmpty()) return@withContext null
 
             val suggestedByBundle = suggestedVersionsByBundle.first()
@@ -1340,13 +1360,27 @@ class PatchBundleRepository(
             }
         }
 
-    suspend fun isVersionAllowed(packageName: String, version: String) =
-        assessVersionSelection(packageName, version).isAllowed
+    suspend fun isVersionAllowed(packageName: String, version: String, versionCode: Long? = null) =
+        assessVersionSelection(packageName, version, versionCode).isAllowed
 
-    suspend fun assessVersionSelection(packageName: String, version: String) =
+    suspend fun assessVersionSelection(
+        packageName: String,
+        version: String,
+        versionCode: Long? = null
+    ) =
         withContext(Dispatchers.Default) {
-            val match = findBestBundleVersionMatch(packageName, version)
+            val match = findBestBundleVersionMatch(packageName, version, versionCode)
             val suggestedVersion = suggestedVersions.first()[packageName]
+            val suggestedVersionCodes = suggestedVersion?.let { targetVersion ->
+                enabledBundlesInfoFlow.first().values
+                    .asSequence()
+                    .filter { it.bundleType == PatchBundleType.MORPHE }
+                    .flatMap { it.patches.asSequence() }
+                    .flatMap { it.compatiblePackages.orEmpty().asSequence() }
+                    .filter { it.packageName == packageName }
+                    .flatMap { it.versionCodes?.get(targetVersion).orEmpty().asSequence() }
+                    .toSet()
+            }.orEmpty()
             val allowUniversalPatches = prefs.disableUniversalPatchCheck.get()
             val allowIncompatiblePatches = prefs.disablePatchVersionCompatCheck.get()
             val requireSuggestedVersion = prefs.suggestedVersionSafeguard.get()
@@ -1372,6 +1406,7 @@ class PatchBundleRepository(
             VersionSelectionAssessment(
                 isAllowed = isAllowed,
                 suggestedVersion = suggestedVersion,
+                suggestedVersionCodes = suggestedVersionCodes,
                 canContinueWithUniversalFallback = canContinueWithUniversalFallback,
                 requiresUniversalPatchesEnabled = requiresUniversalPatchesEnabled
             )
@@ -1874,13 +1909,27 @@ class PatchBundleRepository(
 
         val updatedSource = store.state.value.sources[src.uid] as? RemotePatchBundle ?: return true
         val allowUnsafeDownload = prefs.allowMeteredUpdates.get()
-        updateNow(
-            force = true,
-            allowUnsafeNetwork = allowUnsafeDownload,
-            onPerBundleProgress = { bundle, bytesRead, bytesTotal ->
-                if (bundle.uid == updatedSource.uid) onProgress?.invoke(bytesRead, bytesTotal)
-            }
-        ) { it.uid == updatedSource.uid }
+        val progressNotification =
+            downloadProgressNotifier.begin(progressLabelFor(updatedSource))
+        val updated = try {
+            updateNow(
+                force = true,
+                allowUnsafeNetwork = allowUnsafeDownload,
+                onPerBundleProgress = { bundle, bytesRead, bytesTotal ->
+                    if (bundle.uid == updatedSource.uid) {
+                        progressNotification.update(bytesRead, bytesTotal)
+                        onProgress?.invoke(bytesRead, bytesTotal)
+                    }
+                }
+            ) { it.uid == updatedSource.uid }
+        } catch (error: CancellationException) {
+            progressNotification.cancel()
+            throw error
+        } catch (error: Exception) {
+            progressNotification.fail()
+            throw error
+        }
+        if (updated) progressNotification.complete() else progressNotification.fail()
         return true
     }
 
@@ -2114,35 +2163,56 @@ class PatchBundleRepository(
         createdAt: Long? = null,
         updatedAt: Long? = null,
         onProgress: PatchBundleDownloadProgress? = null,
-    ) =
-        dispatchAction("Add bundle ($url)") { state ->
-            val normalizedUrl = try {
-                normalizeRemoteBundleUrl(url)
-            } catch (e: IllegalArgumentException) {
-                withContext(Dispatchers.Main) {
-                    app.toast(e.message ?: "Invalid bundle URL")
-                }
-                return@dispatchAction state
+    ) {
+        val normalizedUrl = try {
+            normalizeRemoteBundleUrl(url)
+        } catch (e: IllegalArgumentException) {
+            withContext(Dispatchers.Main) {
+                app.toast(e.message ?: "Invalid bundle URL")
             }
+            return
+        }
 
-            val src = createEntity(
-                "",
-                SourceInfo.from(normalizedUrl),
-                autoUpdate,
-                searchUpdate = searchUpdate,
-                createdAt = createdAt,
-                updatedAt = updatedAt
-            ).load() as RemotePatchBundle
-            val allowUnsafeDownload = prefs.allowMeteredUpdates.get()
-            update(
-                src,
-                allowUnsafeNetwork = allowUnsafeDownload,
-                onPerBundleProgress = { bundle, bytesRead, bytesTotal ->
-                    if (bundle.uid == src.uid) onProgress?.invoke(bytesRead, bytesTotal)
-                }
-            )
+        val src = createEntity(
+            "",
+            SourceInfo.from(normalizedUrl),
+            autoUpdate,
+            searchUpdate = searchUpdate,
+            createdAt = createdAt,
+            updatedAt = updatedAt
+        ).load() as RemotePatchBundle
+        dispatchAction("Add bundle ($url)") { state ->
             state.copy(sources = state.sources.put(src.uid, src))
         }
+        withTimeoutOrNull(2_000) {
+            sources.first { list -> list.any { it.uid == src.uid } }
+        }
+
+        val allowUnsafeDownload = prefs.allowMeteredUpdates.get()
+        val progressNotification = downloadProgressNotifier.begin(
+            progressLabelFor(src).ifBlank { "Patch bundle" }
+        )
+        val updated = try {
+            updateNow(
+                allowUnsafeNetwork = allowUnsafeDownload,
+                showProgress = false,
+                onPerBundleProgress = { bundle, bytesRead, bytesTotal ->
+                    if (bundle.uid == src.uid) {
+                        progressNotification.update(bytesRead, bytesTotal)
+                        onProgress?.invoke(bytesRead, bytesTotal)
+                    }
+                },
+                predicate = { it.uid == src.uid }
+            )
+        } catch (error: CancellationException) {
+            progressNotification.cancel()
+            throw error
+        } catch (error: Exception) {
+            progressNotification.fail()
+            throw error
+        }
+        if (updated) progressNotification.complete() else progressNotification.fail()
+    }
 
     suspend fun createRemoteFromDiscovery(
         bundle: ExternalBundleSnapshot,
@@ -2199,14 +2269,29 @@ class PatchBundleRepository(
             sources.first { list -> list.any { it.uid == src.uid } }
         }
         val allowUnsafeDownload = prefs.allowMeteredUpdates.get()
-        updateNow(
-            allowUnsafeNetwork = allowUnsafeDownload,
-            showProgress = false,
-            onPerBundleProgress = { bundleSrc, bytesRead, bytesTotal ->
-                if (bundleSrc.uid == src.uid) onProgress?.invoke(bytesRead, bytesTotal)
-            },
-            predicate = { it.uid == src.uid }
+        val progressNotification = downloadProgressNotifier.begin(
+            bundle.repoName.ifBlank { bundle.ownerName.ifBlank { "Patch bundle" } }
         )
+        val updated = try {
+            updateNow(
+                allowUnsafeNetwork = allowUnsafeDownload,
+                showProgress = false,
+                onPerBundleProgress = { bundleSrc, bytesRead, bytesTotal ->
+                    if (bundleSrc.uid == src.uid) {
+                        progressNotification.update(bytesRead, bytesTotal)
+                        onProgress?.invoke(bytesRead, bytesTotal)
+                    }
+                },
+                predicate = { it.uid == src.uid }
+            )
+        } catch (error: CancellationException) {
+            progressNotification.cancel()
+            throw error
+        } catch (error: Exception) {
+            progressNotification.fail()
+            throw error
+        }
+        if (updated) progressNotification.complete() else progressNotification.fail()
     }
 
     private fun externalBundleEndpoint(
@@ -2832,6 +2917,7 @@ class PatchBundleRepository(
                         )
                     }
                     onPerBundleProgress?.invoke(bundle, 0L, null)
+                    var progressNotification: DownloadProgressNotifier.Session? = null
 
                     val onProgress: PatchBundleDownloadProgress = { bytesRead, bytesTotal ->
                         if (isRemoteUpdateCancelled(bundle.uid)) {
@@ -2847,9 +2933,17 @@ class PatchBundleRepository(
                                 )
                             }
                         }
+                        if (showProgress && onPerBundleProgress == null) {
+                            val notification = progressNotification
+                                ?: downloadProgressNotifier.begin(progressLabelFor(bundle)).also {
+                                    progressNotification = it
+                                }
+                            notification.update(bytesRead, bytesTotal)
+                        }
                         onPerBundleProgress?.invoke(bundle, bytesRead, bytesTotal)
                     }
 
+                    var bundleFailed = false
                     val result = try {
                         withTimeout(REMOTE_BUNDLE_UPDATE_TIMEOUT_MS) {
                             if (force) bundle.downloadLatest(onProgress) else bundle.update(onProgress)
@@ -2857,15 +2951,26 @@ class PatchBundleRepository(
                     } catch (e: BundleUpdateCancelled) {
                         null
                     } catch (e: TimeoutCancellationException) {
+                        bundleFailed = true
                         hadBundleFailures = true
                         if (lastUpdateError == null) lastUpdateError = e
                         Log.e(tag, "Timed out while updating patch bundle: ${bundle.name}", e)
                         null
+                    } catch (e: CancellationException) {
+                        progressNotification?.cancel()
+                        throw e
                     } catch (e: Exception) {
+                        bundleFailed = true
                         hadBundleFailures = true
                         if (lastUpdateError == null) lastUpdateError = e
                         Log.e(tag, "Failed to update patch bundle: ${bundle.name}", e)
                         null
+                    }
+
+                    when {
+                        result != null -> progressNotification?.complete()
+                        bundleFailed -> progressNotification?.fail()
+                        else -> progressNotification?.cancel()
                     }
 
                     val downloadedName = if (result != null) {
@@ -2910,6 +3015,8 @@ class PatchBundleRepository(
                 }
 
                 results
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.e(tag, "Failed to update patches", e)
                 toast(R.string.patches_download_fail, e.simpleMessage())
@@ -3114,6 +3221,7 @@ class PatchBundleRepository(
     data class VersionSelectionAssessment(
         val isAllowed: Boolean,
         val suggestedVersion: String?,
+        val suggestedVersionCodes: Set<Long> = emptySet(),
         val canContinueWithUniversalFallback: Boolean = false,
         val requiresUniversalPatchesEnabled: Boolean = false
     )
@@ -3168,6 +3276,7 @@ class PatchBundleRepository(
         val bytesRead: Long = 0L,
         val bytesTotal: Long? = null,
         val isStepBased: Boolean = false,
+        val bundleCount: Int = total,
     ) {
         val ratio: Float?
             get() {

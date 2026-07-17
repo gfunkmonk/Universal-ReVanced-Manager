@@ -73,13 +73,18 @@ import app.urv.manager.data.platform.Filesystem
 import app.urv.manager.ui.component.AppIcon
 import app.urv.manager.ui.component.AppLabel
 import app.urv.manager.ui.component.AppTopBar
+import app.urv.manager.ui.component.AppVersion
+import app.urv.manager.ui.component.suggestedVersionLabel
 import app.urv.manager.ui.component.CheckedFilterChip
 import app.urv.manager.ui.component.ExperimentalVersionBadge
+import app.urv.manager.ui.component.ExpandableText
 import app.urv.manager.ui.component.InterceptBackHandler
 import app.urv.manager.ui.component.LazyColumnWithScrollbar
 import app.urv.manager.ui.component.ShimmerBox
 import app.urv.manager.ui.component.NonSuggestedVersionDialog
 import app.urv.manager.ui.component.TransparentLoadingDialog
+import app.urv.manager.ui.component.RememberedGetContent
+import app.urv.manager.ui.component.toPickerDirectoryUri
 import app.urv.manager.ui.component.UniversalFallbackVersionDialog
 import app.urv.manager.ui.component.patches.PathSelectorDialog
 import app.urv.manager.ui.component.SafeguardHintCard
@@ -121,6 +126,7 @@ fun AppSelectorScreen(
     val searchEngineHost by prefs.searchEngineHost.getAsState()
     val filterInstalledOnly by prefs.appSelectorFilterInstalledOnly.getAsState()
     val filterPatchesAvailable by prefs.appSelectorFilterPatchesAvailable.getAsState()
+    val apkInputDirectory by prefs.apkInputLastDirectory.getAsState()
     val coroutineScope = rememberCoroutineScope()
 
     EventEffect(flow = vm.storageSelectionFlow) {
@@ -142,9 +148,14 @@ fun AppSelectorScreen(
             }
         }
     val openDocumentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
+        contract = RememberedGetContent {
+            apkInputDirectory.takeIf(String::isNotBlank)?.let(Uri::parse)
+        }
     ) { uri ->
         if (uri != null) {
+            coroutineScope.launch {
+                prefs.apkInputLastDirectory.update(uri.toPickerDirectoryUri().toString())
+            }
             vm.handleStorageResult(uri)
         } else if (returnToDashboardOnStorage) {
             onBackClick()
@@ -183,7 +194,8 @@ fun AppSelectorScreen(
                 }
             },
             fileFilter = ::isAllowedApkFile,
-            allowDirectorySelection = false
+            allowDirectorySelection = false,
+            lastDirectoryPreference = prefs.apkInputLastDirectory
         )
     }
 
@@ -236,6 +248,7 @@ fun AppSelectorScreen(
             suggestedVersion = vm.nonSuggestedVersionDialogSuggestedVersion
                 ?.takeUnless { it.isBlank() }
                 ?: suggestedVersions[local.packageName].orEmpty().ifBlank { local.version },
+            suggestedVersionCodes = vm.nonSuggestedVersionDialogSuggestedVersionCodes,
             requiresUniversalPatchesEnabled = vm.nonSuggestedVersionDialogRequiresUniversalEnabled,
             onDismiss = vm::dismissNonSuggestedVersionDialog
         )
@@ -264,7 +277,15 @@ fun AppSelectorScreen(
                             patchCount = app.patches,
                             onClick = { onSelect(app.packageName) },
                             modifier = Modifier.fillMaxWidth()
-                        )
+                        ) {
+                            SuggestedVersionsDropdown(
+                                packageInfo = app.packageInfo,
+                                packageName = app.packageName,
+                                bundleSuggestions = bundleSuggestionsByApp[app.packageName].orEmpty(),
+                                bundleRecommendationsEnabled = bundleRecommendationsEnabled,
+                                searchEngineHost = searchEngineHost
+                            )
+                        }
                     }
                 }
             } else if (appList.isEmpty()) {
@@ -436,6 +457,7 @@ fun AppSelectorScreen(
                                         bundleSuggestions.forEach { suggestion ->
                                             BundleSuggestionCard(
                                                 suggestion = suggestion,
+                                                packageInfo = app.packageInfo,
                                                 packageName = app.packageName,
                                                 searchEngineHost = searchEngineHost,
                                                 enabled = bundleRecommendationsEnabled,
@@ -459,8 +481,10 @@ fun AppSelectorScreen(
                                     ?.let { suggestion ->
                                         OtherSupportedVersionsInfoDialog(
                                             bundleName = suggestion.bundleName,
+                                            packageInfo = app.packageInfo,
                                             packageName = app.packageName,
                                             recommendedVersion = suggestion.recommendedVersion,
+                                            recommendedVersionCodes = suggestion.recommendedVersionCodes,
                                             recommendedVersionExperimental = suggestion.recommendedVersionExperimental,
                                             otherVersions = suggestion.otherSupportedVersions,
                                             supportsAllVersions = suggestion.supportsAllVersions,
@@ -664,6 +688,7 @@ private fun AppSelectorCard(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
+                    AppVersion(packageInfo)
                 }
                 patchCount?.takeIf { it > 0 }?.let { count ->
                     Surface(
@@ -685,10 +710,117 @@ private fun AppSelectorCard(
 }
 
 @Composable
+private fun SuggestedVersionsDropdown(
+    packageInfo: PackageInfo?,
+    packageName: String,
+    bundleSuggestions: List<BundleVersionSuggestion>,
+    bundleRecommendationsEnabled: Boolean,
+    searchEngineHost: String,
+    modifier: Modifier = Modifier
+) {
+    if (bundleSuggestions.isEmpty()) return
+
+    var expanded by rememberSaveable(packageName) { mutableStateOf(false) }
+    var dialogBundleUid by remember { mutableStateOf<Int?>(null) }
+
+    LaunchedEffect(bundleRecommendationsEnabled) {
+        if (!bundleRecommendationsEnabled) {
+            expanded = false
+            dialogBundleUid = null
+        }
+    }
+
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        val toggleLabel = stringResource(
+            if (expanded) R.string.hide_suggested_versions
+            else R.string.show_suggested_versions
+        )
+        TextButton(
+            onClick = { expanded = !expanded },
+            modifier = Modifier.align(Alignment.Start),
+            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+        ) {
+            Icon(
+                imageVector = if (expanded) Icons.Outlined.ExpandLess else Icons.Outlined.ChevronRight,
+                contentDescription = null
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(
+                text = toggleLabel,
+                style = MaterialTheme.typography.labelLarge,
+                color = if (bundleRecommendationsEnabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
+        if (expanded) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                if (!bundleRecommendationsEnabled) {
+                    SafeguardHintCard(
+                        title = stringResource(R.string.bundle_version_dialog_locked_title),
+                        description = stringResource(R.string.bundle_version_dialog_locked_hint),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+
+                bundleSuggestions.forEach { suggestion ->
+                    BundleSuggestionCard(
+                        suggestion = suggestion,
+                        packageInfo = packageInfo,
+                        packageName = packageName,
+                        searchEngineHost = searchEngineHost,
+                        enabled = bundleRecommendationsEnabled,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .widthIn(max = 560.dp)
+                            .alpha(if (bundleRecommendationsEnabled) 1f else 0.6f),
+                        onShowOtherVersions = {
+                            if (bundleRecommendationsEnabled) {
+                                dialogBundleUid = suggestion.bundleUid
+                            }
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    if (dialogBundleUid != null && bundleRecommendationsEnabled) {
+        bundleSuggestions
+            .firstOrNull { it.bundleUid == dialogBundleUid }
+            ?.let { suggestion ->
+                OtherSupportedVersionsInfoDialog(
+                    bundleName = suggestion.bundleName,
+                    packageInfo = packageInfo,
+                    packageName = packageName,
+                    recommendedVersion = suggestion.recommendedVersion,
+                    recommendedVersionCodes = suggestion.recommendedVersionCodes,
+                    recommendedVersionExperimental = suggestion.recommendedVersionExperimental,
+                    otherVersions = suggestion.otherSupportedVersions,
+                    supportsAllVersions = suggestion.supportsAllVersions,
+                    searchEngineHost = searchEngineHost,
+                    onDismissRequest = { dialogBundleUid = null }
+                )
+            }
+    } else if (dialogBundleUid != null) {
+        dialogBundleUid = null
+    }
+}
+
+@Composable
 private fun VersionSearchRow(
     label: String,
     packageName: String,
     version: String?,
+    versionCodes: Set<Long> = emptySet(),
     searchEngineHost: String,
     modifier: Modifier = Modifier,
     highlighted: Boolean = false,
@@ -703,6 +835,7 @@ private fun VersionSearchRow(
             label = label,
             packageName = packageName,
             version = version,
+            versionCodes = versionCodes,
             searchEngineHost = searchEngineHost,
             highlighted = highlighted,
             experimental = experimental
@@ -715,6 +848,7 @@ private fun VersionSearchChip(
     label: String,
     packageName: String,
     version: String?,
+    versionCodes: Set<Long> = emptySet(),
     searchEngineHost: String,
     modifier: Modifier = Modifier,
     highlighted: Boolean = false,
@@ -739,7 +873,9 @@ private fun VersionSearchChip(
             .heightIn(min = 52.dp)
     }
     Surface(
-        onClick = { context.openUrl(buildSearchUrl(packageName, version, searchEngineHost)) },
+        onClick = {
+            context.openUrl(buildSearchUrl(packageName, version, versionCodes, searchEngineHost))
+        },
         modifier = chipModifier,
         shape = if (highlighted) RoundedCornerShape(999.dp) else RoundedCornerShape(6.dp),
         color = background,
@@ -771,12 +907,10 @@ private fun VersionSearchChip(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                Text(
+                ExpandableText(
                     text = label,
                     style = MaterialTheme.typography.labelLarge,
-                    textAlign = TextAlign.Center,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                    textAlign = TextAlign.Center
                 )
                 Icon(
                     imageVector = Icons.Outlined.Search,
@@ -791,16 +925,27 @@ private fun VersionSearchChip(
     }
 }
 
-private fun buildSearchUrl(packageName: String, version: String?, searchEngineHost: String): String {
+private fun buildSearchUrl(
+    packageName: String,
+    version: String?,
+    versionCodes: Set<Long>,
+    searchEngineHost: String
+): String {
     val encodedPackage = Uri.encode(packageName)
     val encodedVersion = version?.takeIf { it.isNotBlank() }?.let {
         val formatted = if (it.startsWith("v", ignoreCase = true)) it else "v$it"
         Uri.encode(formatted)
     }
+    val encodedVersionCodes = versionCodes.sorted().map { Uri.encode(it.toString()) }
     val encodedArch = Build.SUPPORTED_ABIS.firstOrNull()
         ?.takeIf { it.isNotBlank() }
         ?.let(Uri::encode)
-    val query = listOfNotNull(encodedPackage, encodedVersion, encodedArch).joinToString("+")
+    val query = buildList {
+        add(encodedPackage)
+        encodedVersion?.let(::add)
+        addAll(encodedVersionCodes)
+        encodedArch?.let(::add)
+    }.joinToString("+")
     val host = normalizeSearchHost(searchEngineHost)
     return "https://$host/search?q=$query"
 }
@@ -816,8 +961,10 @@ private fun normalizeSearchHost(value: String): String {
 @Composable
 private fun OtherSupportedVersionsInfoDialog(
     bundleName: String,
+    packageInfo: PackageInfo?,
     packageName: String,
     recommendedVersion: String?,
+    recommendedVersionCodes: Set<Long>,
     recommendedVersionExperimental: Boolean,
     otherVersions: List<SupportedVersionInfo>,
     supportsAllVersions: Boolean,
@@ -842,10 +989,15 @@ private fun OtherSupportedVersionsInfoDialog(
                     VersionSearchRow(
                         label = stringResource(
                             R.string.bundle_version_suggested_label,
-                            stringResource(R.string.version_label, version)
+                            suggestedVersionLabel(
+                                versionName = version,
+                                versionCodes = recommendedVersionCodes,
+                                displayVersion = stringResource(R.string.version_label, version)
+                            )
                         ),
                         packageName = packageName,
                         version = version,
+                        versionCodes = recommendedVersionCodes,
                         searchEngineHost = searchEngineHost,
                         modifier = Modifier.align(Alignment.CenterHorizontally),
                         highlighted = true,
@@ -862,9 +1014,14 @@ private fun OtherSupportedVersionsInfoDialog(
                                 ) {
                                     row.forEach { info ->
                                         VersionSearchRow(
-                                            label = stringResource(R.string.version_label, info.version),
+                                            label = suggestedVersionLabel(
+                                                versionName = info.version,
+                                                versionCodes = info.versionCodes,
+                                                displayVersion = stringResource(R.string.version_label, info.version)
+                                            ),
                                             packageName = packageName,
                                             version = info.version,
+                                            versionCodes = info.versionCodes,
                                             searchEngineHost = searchEngineHost,
                                             modifier = Modifier.weight(1f),
                                             experimental = info.experimental
@@ -903,6 +1060,7 @@ private fun OtherSupportedVersionsInfoDialog(
 @Composable
 private fun BundleSuggestionCard(
     suggestion: BundleVersionSuggestion,
+    packageInfo: PackageInfo?,
     packageName: String,
     searchEngineHost: String,
     enabled: Boolean,
@@ -928,7 +1086,13 @@ private fun BundleSuggestionCard(
                     .consumeHorizontalScroll(nameScrollState)
             )
             val versionLabel = suggestion.recommendedVersion
-                ?.let { stringResource(R.string.version_label, it) }
+                ?.let { version ->
+                    suggestedVersionLabel(
+                        versionName = version,
+                        versionCodes = suggestion.recommendedVersionCodes,
+                        displayVersion = stringResource(R.string.version_label, version)
+                    )
+                }
                 ?: stringResource(R.string.bundle_version_all_versions)
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -939,6 +1103,7 @@ private fun BundleSuggestionCard(
                         label = versionLabel,
                         packageName = packageName,
                         version = suggestion.recommendedVersion,
+                        versionCodes = suggestion.recommendedVersionCodes,
                         searchEngineHost = searchEngineHost,
                         modifier = Modifier,
                         highlighted = true,

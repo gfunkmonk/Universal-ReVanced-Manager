@@ -120,6 +120,8 @@ class SelectedAppInfoViewModel(
     val prefs: PreferencesManager = get()
     private var selectionLoadJob: Job? = null
     private var optionsLoadJob: Job? = null
+    // Recommendation mode scopes the active selection to one bundle, so retain each bundle's custom choices here.
+    private val rememberedBundleSelections = mutableMapOf<Int, Set<String>>()
     val plugins = pluginsRepository.loadedPluginsFlow
     val desiredVersion = input.app.version
     val packageName = input.app.packageName
@@ -265,7 +267,8 @@ class SelectedAppInfoViewModel(
                     SupportedVersionInfo(
                         version = version,
                         experimental = version in support.experimentalVersions &&
-                            version !in support.stableVersions
+                            version !in support.stableVersions,
+                        versionCodes = support.versionCodes[version].orEmpty()
                     )
                 }
 
@@ -275,6 +278,7 @@ class SelectedAppInfoViewModel(
                     ?.takeIf { it.isNotBlank() }
                     ?: scoped.name,
                 recommendedVersion = recommended,
+                recommendedVersionCodes = recommended?.let(support.versionCodes::get).orEmpty(),
                 recommendedVersionExperimental = recommendedExperimental,
                 otherSupportedVersions = otherVersions,
                 supportsAllVersions = support.supportsAllVersions
@@ -312,6 +316,15 @@ class SelectedAppInfoViewModel(
     }
         private set
 
+    data class RemovedPatchesNotice(val patchNames: List<String>)
+
+    var removedPatchesNotice by mutableStateOf<RemovedPatchesNotice?>(null)
+        private set
+
+    fun dismissRemovedPatchesNotice() {
+        removedPatchesNotice = null
+    }
+
     private fun loadOptionsFromRepository() {
         if (optionsLoadJob?.isActive == true) return
         optionsLoadJob = viewModelScope.launch {
@@ -341,9 +354,12 @@ class SelectedAppInfoViewModel(
         if (shouldLoadPersistedSelection) {
             selectionLoadJob = viewModelScope.launch {
                 if (!prefs.disableSelectionWarning.get()) return@launch
+                bundleRepository.reloadInProgress.first { loading -> !loading }
                 val previous = selectionRepository.getSelection(packageName)
                 if (previous.values.sumOf { it.size } == 0) return@launch
+
                 selectionState = SelectionState.Customized(previous)
+                removeDeletedPatchesFromSavedSelection()
                 pruneSelectionForAvailability(
                     bundleInfoFlowInternal.value,
                     prefs.disablePatchVersionCompatCheck.get()
@@ -366,7 +382,8 @@ class SelectedAppInfoViewModel(
                 packageInfo.await()?.let {
                     SelectedApp.Installed(
                         packageName,
-                        it.versionName!!
+                        it.versionName!!,
+                        pm.getVersionCode(it)
                     ) to installedApp
                 }
             if (profileId == null && input.patches != null) {
@@ -385,7 +402,7 @@ class SelectedAppInfoViewModel(
         viewModelScope.launch {
             selectedAppState
                 .flatMapLatest { app ->
-                    bundleRepository.scopedBundleInfoFlow(app.packageName, app.version)
+                    bundleRepository.scopedBundleInfoFlow(app.packageName, app.version, app.versionCode)
                 }
                 .combine(allowUniversalFlow.distinctUntilChanged()) { bundles, allowUniversal ->
                     allowUniversal to bundles
@@ -401,6 +418,7 @@ class SelectedAppInfoViewModel(
                         bundles.map(PatchBundleInfo.Scoped::withoutUniversalPatches)
                     }
                     bundleInfoFlowInternal.value = visibleBundles
+                    removeDeletedPatchesFromSavedSelection()
                     pruneSelectionForAvailability(visibleBundles, allowIncompatible)
                 }
         }
@@ -416,14 +434,18 @@ class SelectedAppInfoViewModel(
                 val current = selectedApp
                 when (current) {
                     is SelectedApp.Search -> if (current.version != target) {
-                        selectedApp = current.copy(version = target)
+                        selectedApp = current.copy(version = target, versionCode = null)
                     }
 
                     is SelectedApp.Download -> if (
                         current.version.isNullOrBlank() ||
                         (target != null && current.version != target)
                     ) {
-                        selectedApp = current.copy(version = target ?: current.version)
+                        val version = target ?: current.version
+                        selectedApp = current.copy(
+                            version = version,
+                            versionCode = current.versionCode.takeIf { current.version == version }
+                        )
                     }
 
                     else -> Unit
@@ -461,9 +483,7 @@ class SelectedAppInfoViewModel(
                             prefs.disablePatchVersionCompatCheck.get()
                         )
                     } else {
-                        if (selectionState is SelectionState.Customized) {
-                            selectionState = SelectionState.Default
-                        }
+                        clearSelectionState()
                     }
                 }
             }
@@ -492,12 +512,14 @@ class SelectedAppInfoViewModel(
     }
 
     private fun clearSelectionState() {
+        rememberedBundleSelections.clear()
         if (selectionState is SelectionState.Customized) {
             selectionState = SelectionState.Default
         }
     }
 
     private fun clearSelectionForBundle(bundleUid: Int) {
+        rememberedBundleSelections.remove(bundleUid)
         val current = selectionState
         if (current !is SelectionState.Customized) return
         if (bundleUid !in current.patchSelection) return
@@ -646,6 +668,8 @@ class SelectedAppInfoViewModel(
                 apkVersion = null,
                 useSelectedApkVersion = false,
                 autoPatch = false,
+                installerToken = null,
+                autoInstall = false,
                 createdAt = 0L,
                 payload = remappedPayload
             ).toConfiguration(scopedBundles, sources)
@@ -659,6 +683,43 @@ class SelectedAppInfoViewModel(
             ).join()
         }
     }
+
+    private suspend fun removeDeletedPatchesFromSavedSelection() {
+        if (!shouldLoadPersistedSelection) return
+        val currentState = selectionState as? SelectionState.Customized ?: return
+        val availablePatches = bundleRepository.allBundlesInfoFlow.first()
+            .mapValues { (_, bundle) ->
+                bundle.patches.mapTo(mutableSetOf()) { it.name }
+            }
+        val removedPatchesByBundle = currentState.patchSelection.mapValues { (bundleUid, selectedPatches) ->
+            val available = availablePatches[bundleUid].orEmpty()
+            selectedPatches.filterNotTo(mutableSetOf()) { it in available }
+        }.filterValues { it.isNotEmpty() }
+        val removedPatches = removedPatchesByBundle.values
+            .flatten()
+            .sorted()
+        if (removedPatches.isEmpty()) return
+
+        val cleanedSelection = currentState.patchSelection.mapNotNull { (bundleUid, selectedPatches) ->
+            val available = availablePatches[bundleUid].orEmpty()
+            selectedPatches.filterTo(mutableSetOf()) { it in available }
+                .takeIf { it.isNotEmpty() }
+                ?.let { bundleUid to it }
+        }.toMap()
+
+        selectionState = SelectionState.Customized(cleanedSelection)
+        options = options.mapNotNull { (bundleUid, patchOptions) ->
+            val removedForBundle = removedPatchesByBundle[bundleUid].orEmpty()
+            patchOptions.filterKeys { it !in removedForBundle }
+                .takeIf { it.isNotEmpty() }
+                ?.let { bundleUid to it }
+        }.toMap()
+        selectionRepository.updateSelection(packageName, cleanedSelection)
+        optionsRepository.removeOptionsForPatches(packageName, removedPatchesByBundle)
+        val pendingNames = removedPatchesNotice?.patchNames.orEmpty()
+        removedPatchesNotice = RemovedPatchesNotice((pendingNames + removedPatches).sorted())
+    }
+
     private fun pruneSelectionForAvailability(
         bundles: List<PatchBundleInfo.Scoped>,
         allowIncompatible: Boolean
@@ -722,6 +783,8 @@ class SelectedAppInfoViewModel(
         private set
     var nonSuggestedVersionDialogSuggestedVersion by mutableStateOf<String?>(null)
         private set
+    var nonSuggestedVersionDialogSuggestedVersionCodes by mutableStateOf<Set<Long>>(emptySet())
+        private set
     var nonSuggestedVersionDialogRequiresUniversalEnabled by mutableStateOf(false)
         private set
     var universalFallbackDialogSubject by mutableStateOf<SelectedApp.Local?>(null)
@@ -732,6 +795,7 @@ class SelectedAppInfoViewModel(
     fun dismissNonSuggestedVersionDialog() {
         nonSuggestedVersionDialogSubject = null
         nonSuggestedVersionDialogSuggestedVersion = null
+        nonSuggestedVersionDialogSuggestedVersionCodes = emptySet()
         nonSuggestedVersionDialogRequiresUniversalEnabled = false
     }
 
@@ -863,7 +927,11 @@ class SelectedAppInfoViewModel(
     }
 
     private suspend fun handleSelectedStorageApk(local: SelectedApp.Local) {
-        val assessment = bundleRepository.assessVersionSelection(local.packageName, local.version)
+        val assessment = bundleRepository.assessVersionSelection(
+            local.packageName,
+            local.version,
+            local.versionCode
+        )
         if (!assessment.isAllowed) {
             if (assessment.canContinueWithUniversalFallback) {
                 universalFallbackDialogSubject = local
@@ -872,6 +940,7 @@ class SelectedAppInfoViewModel(
             } else {
                 nonSuggestedVersionDialogSubject = local
                 nonSuggestedVersionDialogSuggestedVersion = assessment.suggestedVersion
+                nonSuggestedVersionDialogSuggestedVersionCodes = assessment.suggestedVersionCodes
                 nonSuggestedVersionDialogRequiresUniversalEnabled =
                     assessment.requiresUniversalPatchesEnabled
                 dismissUniversalFallbackDialog()
@@ -904,7 +973,8 @@ class SelectedAppInfoViewModel(
                     packageName = packageInfo.packageName,
                     version = packageInfo.versionName ?: "",
                     file = storageInputFile,
-                    temporary = true
+                    temporary = true,
+                    versionCode = pm.getVersionCode(packageInfo)
                 )
             }?.let(LocalApkLoadResult::Success) ?: LocalApkLoadResult.Failed
         } ?: LocalApkLoadResult.Failed
@@ -926,7 +996,8 @@ class SelectedAppInfoViewModel(
                 packageName = packageInfo.packageName,
                 version = packageInfo.versionName ?: "",
                 file = storageInputFile,
-                temporary = true
+                temporary = true,
+                versionCode = pm.getVersionCode(packageInfo)
             )
         }?.let(LocalApkLoadResult::Success) ?: LocalApkLoadResult.Failed
     }
@@ -1042,43 +1113,60 @@ class SelectedAppInfoViewModel(
         when (val current = selectedApp) {
             is SelectedApp.Search -> {
                 if (current.version != targetVersion) {
-                    selectedApp = current.copy(version = targetVersion)
+                    selectedApp = current.copy(version = targetVersion, versionCode = null)
                 }
             }
 
             is SelectedApp.Download -> {
                 if (current.version.isNullOrBlank() || (targetVersion != null && current.version != targetVersion)) {
-                    selectedApp = current.copy(version = targetVersion ?: current.version)
+                    val version = targetVersion ?: current.version
+                    selectedApp = current.copy(
+                        version = version,
+                        versionCode = current.versionCode.takeIf { current.version == version }
+                    )
                 }
             }
 
             else -> Unit
         }
 
-        if (bundleUid != null && (selectionState is SelectionState.Default || customSelectionEmpty)) {
+        if (bundleUid != null) {
             applyBundleRecommendationSelection(bundleUid)
         }
     }
 
     private fun applyBundleRecommendationSelection(bundleUid: Int) = viewModelScope.launch {
+        selectionLoadJob?.join()
+        (selectionState as? SelectionState.Customized)
+            ?.patchSelection
+            ?.let(::rememberBundleSelections)
+
         val bundles = bundleInfoFlow.first()
         val bundle = bundles.firstOrNull { it.uid == bundleUid } ?: return@launch
         val allowIncompatible = prefs.disablePatchVersionCompatCheck.get()
-        val selectedPatches = bundle.patchSequence(allowIncompatible)
-            .filter { it.include }
-            .map { it.name }
-            .toSet()
-            .ifEmpty {
-                bundle.patchSequence(false)
-                    .filter { it.include }
-                    .map { it.name }
-                    .toSet()
-            }
-            .ifEmpty {
-                bundle.patchSequence(false)
-                    .map { it.name }
-                    .toSet()
-            }
+        val availablePatches = bundle.patchSequence(allowIncompatible).toList()
+        val availablePatchNames = availablePatches.mapTo(mutableSetOf()) { it.name }
+        val customizedPatches = rememberedBundleSelections[bundleUid]
+            ?.filterTo(mutableSetOf()) { it in availablePatchNames }
+            ?.takeIf { it.isNotEmpty() }
+        val selectedPatches = customizedPatches
+            ?: availablePatches
+                .filter { it.include }
+                .map { it.name }
+                .toSet()
+                .ifEmpty {
+                    bundle.patchSequence(false)
+                        .filter { it.include }
+                        .map { it.name }
+                        .toSet()
+                }
+                .ifEmpty {
+                    bundle.patchSequence(false)
+                        .map { it.name }
+                        .toSet()
+                }
+
+        if (preferredBundleUidFlow.value != bundleUid) return@launch
 
         if (selectedPatches.isEmpty()) {
             selectionState = SelectionState.Default
@@ -1086,6 +1174,16 @@ class SelectedAppInfoViewModel(
         }
 
         selectionState = SelectionState.Customized(mapOf(bundleUid to selectedPatches))
+    }
+
+    private fun rememberBundleSelections(selection: PatchSelection) {
+        selection.forEach { (bundleUid, patches) ->
+            if (patches.isEmpty()) {
+                rememberedBundleSelections.remove(bundleUid)
+            } else {
+                rememberedBundleSelections[bundleUid] = patches.toSet()
+            }
+        }
     }
 
     fun searchUsingPlugin(plugin: LoadedDownloaderPlugin) {
@@ -1199,27 +1297,80 @@ class SelectedAppInfoViewModel(
 
         val current = selectedApp
         val resolvedVersion = resolution.packageInfo?.versionName?.takeUnless(String::isNullOrBlank)
+        val resolvedVersionCode = resolution.packageInfo?.let(pm::getVersionCode)
         if (resolution.packageInfo != null) {
             when (current) {
-                is SelectedApp.Local -> if (!current.resolved || current.packageName == current.file.nameWithoutExtension) {
+                is SelectedApp.Local -> if (
+                    !current.resolved ||
+                    current.versionCode != resolvedVersionCode ||
+                    (
+                        current.packageName == current.file.nameWithoutExtension &&
+                            resolution.packageInfo.packageName != current.packageName
+                    )
+                ) {
                     selectedApp = current.copy(
                         packageName = resolution.packageInfo.packageName,
                         version = resolvedVersion ?: current.version,
-                        resolved = true
+                        resolved = true,
+                        versionCode = resolvedVersionCode
                     )
                 }
 
-                is SelectedApp.Download -> if (current.version.isNullOrBlank() || current.packageName == current.version) {
-                    selectedApp = current.copy(
-                        packageName = resolution.packageInfo.packageName,
-                        version = resolvedVersion ?: resolution.packageInfo.versionName
-                    )
+                is SelectedApp.Download -> {
+                    val adoptResolvedVersion =
+                        current.version.isNullOrBlank() || current.packageName == current.version
+                    val resolvedVersionMatches =
+                        resolvedVersion != null && resolvedVersion == current.version
+                    val version = if (adoptResolvedVersion) {
+                        resolvedVersion ?: resolution.packageInfo.versionName
+                    } else {
+                        current.version
+                    }
+                    if (
+                        (adoptResolvedVersion || resolvedVersionMatches) &&
+                        (
+                            current.packageName != resolution.packageInfo.packageName ||
+                            current.version != version ||
+                            current.versionCode != resolvedVersionCode
+                        )
+                    ) {
+                        selectedApp = current.copy(
+                            packageName = resolution.packageInfo.packageName,
+                            version = version,
+                            versionCode = resolvedVersionCode
+                        )
+                    }
                 }
 
-                is SelectedApp.Search -> if (current.version.isNullOrBlank()) {
+                is SelectedApp.Search -> {
+                    val adoptResolvedVersion = current.version.isNullOrBlank()
+                    val resolvedVersionMatches =
+                        resolvedVersion != null && resolvedVersion == current.version
+                    val version = if (adoptResolvedVersion) {
+                        resolvedVersion ?: resolution.packageInfo.versionName
+                    } else {
+                        current.version
+                    }
+                    if (
+                        (adoptResolvedVersion || resolvedVersionMatches) &&
+                        (
+                            current.packageName != resolution.packageInfo.packageName ||
+                            current.version != version ||
+                            current.versionCode != resolvedVersionCode
+                        )
+                    ) {
+                        selectedApp = current.copy(
+                            packageName = resolution.packageInfo.packageName,
+                            version = version,
+                            versionCode = resolvedVersionCode
+                        )
+                    }
+                }
+
+                is SelectedApp.Installed -> if (current.versionCode != resolvedVersionCode) {
                     selectedApp = current.copy(
-                        packageName = resolution.packageInfo.packageName,
-                        version = resolvedVersion ?: resolution.packageInfo.versionName
+                        version = resolvedVersion ?: current.version,
+                        versionCode = resolvedVersionCode
                     )
                 }
 
@@ -1267,10 +1418,14 @@ class SelectedAppInfoViewModel(
         optionsLoadJob?.join()
         val allowIncompatible = prefs.disablePatchVersionCompatCheck.get()
         val bundles = bundleInfoFlow.first()
+        val profile = profileId?.let { patchProfileRepository.getProfile(it) }
         return Patcher.ViewModelParams(
-            selectedApp,
-            getPatches(bundles, allowIncompatible),
-            getOptionsFiltered(bundles)
+            selectedApp = selectedApp,
+            selectedPatches = getPatches(bundles, allowIncompatible),
+            options = getOptionsFiltered(bundles),
+            profileId = profile?.uid,
+            profileInstallerToken = profile?.installerToken,
+            autoInstall = profile?.autoInstall == true
         )
     }
 
@@ -1293,6 +1448,8 @@ class SelectedAppInfoViewModel(
         optionsLoadJob?.cancel()
         optionsLoadJob = null
 
+        rememberedBundleSelections.clear()
+        selection?.let(::rememberBundleSelections)
         selectionState = selection?.let(SelectionState::Customized) ?: SelectionState.Default
 
         val filteredOptions = withContext(Dispatchers.Default) {
@@ -1358,6 +1515,7 @@ class SelectedAppInfoViewModel(
         val versions = mutableSetOf<String>()
         val stableVersions = mutableSetOf<String>()
         val experimentalVersions = mutableSetOf<String>()
+        val versionCodes = mutableMapOf<String, MutableSet<Long>>()
         var hasSupport = false
 
         patches.asSequence()
@@ -1372,6 +1530,11 @@ class SelectedAppInfoViewModel(
                 ?.filter { it.packageName.equals(packageName, ignoreCase = true) }
                 ?.forEach { compatible ->
                     hasSupport = true
+                    if (bundleType == PatchBundleType.MORPHE) {
+                        compatible.versionCodes.orEmpty().forEach { (version, codes) ->
+                            versionCodes.getOrPut(version) { mutableSetOf() } += codes
+                        }
+                    }
                     val supportedVersions = compatible.versions
                     if (supportedVersions.isNullOrEmpty()) {
                         supportsAllVersions = true
@@ -1389,7 +1552,8 @@ class SelectedAppInfoViewModel(
             supportsAllVersions = supportsAllVersions,
             versions = versions,
             stableVersions = stableVersions,
-            experimentalVersions = experimentalVersions
+            experimentalVersions = experimentalVersions,
+            versionCodes = versionCodes
         )
     }
 
@@ -1398,7 +1562,8 @@ class SelectedAppInfoViewModel(
         val supportsAllVersions: Boolean,
         val versions: Set<String>,
         val stableVersions: Set<String>,
-        val experimentalVersions: Set<String>
+        val experimentalVersions: Set<String>,
+        val versionCodes: Map<String, Set<Long>>
     )
 
     private fun PatchBundleInfo.Scoped.recommendedVersionForSelection(
@@ -1715,6 +1880,7 @@ data class BundleRecommendationDetail(
     val bundleUid: Int,
     val name: String,
     val recommendedVersion: String?,
+    val recommendedVersionCodes: Set<Long>,
     val recommendedVersionExperimental: Boolean,
     val otherSupportedVersions: List<SupportedVersionInfo>,
     val supportsAllVersions: Boolean

@@ -1,5 +1,7 @@
 package app.urv.manager.ui.screen
 
+import android.content.pm.PackageInfo
+import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.StringRes
@@ -57,6 +59,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -73,10 +76,13 @@ import app.urv.manager.network.downloader.LoadedDownloaderPlugin
 import app.urv.manager.ui.component.AlertDialogExtended
 import app.urv.manager.ui.component.AppInfo
 import app.urv.manager.ui.component.AppTopBar
+import app.urv.manager.ui.component.AppVersion
+import app.urv.manager.ui.component.suggestedVersionLabel
 import app.urv.manager.ui.component.AppliedPatchBundleUi
 import app.urv.manager.ui.component.AppliedPatchesDialog
 import app.urv.manager.ui.component.ColumnWithScrollbar
 import app.urv.manager.ui.component.ExperimentalVersionBadge
+import app.urv.manager.ui.component.ExpandableText
 import app.urv.manager.ui.component.LoadingIndicator
 import app.urv.manager.ui.component.NonSuggestedVersionDialog
 import app.urv.manager.ui.component.UniversalFallbackVersionDialog
@@ -84,6 +90,8 @@ import app.urv.manager.ui.component.NotificationCard
 import app.urv.manager.ui.component.haptics.HapticExtendedFloatingActionButton
 import app.urv.manager.ui.component.SafeguardHintCard
 import app.urv.manager.ui.component.patches.PathSelectorDialog
+import app.urv.manager.ui.component.RememberedGetContent
+import app.urv.manager.ui.component.toPickerDirectoryUri
 import app.urv.manager.ui.model.SelectedApp
 import app.urv.manager.ui.viewmodel.SelectedAppInfoViewModel
 import app.urv.manager.ui.viewmodel.BundleRecommendationDetail
@@ -130,6 +138,41 @@ fun SelectedAppInfoScreen(
     var showMixedRevancedPatcherDialog by rememberSaveable { mutableStateOf(false) }
     var showPatchSummaryDialog by rememberSaveable { mutableStateOf(false) }
 
+    vm.removedPatchesNotice?.let { notice ->
+        AlertDialog(
+            onDismissRequest = vm::dismissRemovedPatchesNotice,
+            title = {
+                CenteredDialogTitle(
+                    pluralStringResource(
+                        R.plurals.removed_saved_patches_title,
+                        notice.patchNames.size,
+                        notice.patchNames.size
+                    )
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(stringResource(R.string.removed_saved_patches_message))
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 280.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        items(notice.patchNames) { patchName ->
+                            Text(text = "• $patchName")
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = vm::dismissRemovedPatchesNotice) {
+                    Text(stringResource(R.string.ok))
+                }
+            }
+        )
+    }
+
     val allowIncompatiblePatches by vm.prefs.disablePatchVersionCompatCheck.getAsState()
     val suggestedVersionSafeguard by vm.prefs.suggestedVersionSafeguard.getAsState()
     val customBackgroundImageUri by vm.prefs.customBackgroundImageUri.getAsState()
@@ -165,10 +208,22 @@ fun SelectedAppInfoScreen(
                 ?: downloadedApps.firstOrNull()?.version?.takeUnless { it.isNullOrBlank() }
             if (versionOverride.isNullOrBlank()) return@remember app
             when (app) {
-                is SelectedApp.Download -> app.copy(version = versionOverride)
-                is SelectedApp.Search -> app.copy(version = versionOverride)
-                is SelectedApp.Local -> app.copy(version = versionOverride)
-                is SelectedApp.Installed -> app.copy(version = versionOverride)
+                is SelectedApp.Download -> app.copy(
+                    version = versionOverride,
+                    versionCode = app.versionCode.takeIf { app.version == versionOverride }
+                )
+                is SelectedApp.Search -> app.copy(
+                    version = versionOverride,
+                    versionCode = app.versionCode.takeIf { app.version == versionOverride }
+                )
+                is SelectedApp.Local -> app.copy(
+                    version = versionOverride,
+                    versionCode = app.versionCode.takeIf { app.version == versionOverride }
+                )
+                is SelectedApp.Installed -> app.copy(
+                    version = versionOverride,
+                    versionCode = app.versionCode.takeIf { app.version == versionOverride }
+                )
             }
         }
     }
@@ -182,6 +237,8 @@ fun SelectedAppInfoScreen(
     }
     val fs = koinInject<Filesystem>()
     val useCustomFilePicker by vm.prefs.useCustomFilePicker.getAsState()
+    val selectedAppApkInputDirectory by vm.prefs.selectedAppApkInputLastDirectory.getAsState()
+    val pickerScope = rememberCoroutineScope()
     val storageRoots = remember { fs.storageRoots() }
     var showStorageDialog by rememberSaveable { mutableStateOf(false) }
     val (permissionContract, permissionName) = remember { fs.permissionContract() }
@@ -192,9 +249,16 @@ fun SelectedAppInfoScreen(
             }
         }
     val openDocumentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
+        contract = RememberedGetContent {
+            selectedAppApkInputDirectory.takeIf(String::isNotBlank)?.let(Uri::parse)
+        }
     ) { uri ->
         if (uri != null) {
+            pickerScope.launch {
+                vm.prefs.selectedAppApkInputLastDirectory.update(
+                    uri.toPickerDirectoryUri().toString()
+                )
+            }
             vm.handleStorageResult(uri)
         }
     }
@@ -225,7 +289,8 @@ fun SelectedAppInfoScreen(
                 vm.handleStorageFile(path?.let { File(it.toString()) })
             },
             fileFilter = ::isAllowedApkFile,
-            allowDirectorySelection = false
+            allowDirectorySelection = false,
+            lastDirectoryPreference = vm.prefs.selectedAppApkInputLastDirectory
         )
     }
     val composableScope = rememberCoroutineScope()
@@ -311,6 +376,7 @@ fun SelectedAppInfoScreen(
             suggestedVersion = vm.nonSuggestedVersionDialogSuggestedVersion
                 ?.takeUnless { it.isBlank() }
                 ?: local.version,
+            suggestedVersionCodes = vm.nonSuggestedVersionDialogSuggestedVersionCodes,
             requiresUniversalPatchesEnabled = vm.nonSuggestedVersionDialogRequiresUniversalEnabled,
             onDismiss = vm::dismissNonSuggestedVersionDialog
         )
@@ -416,10 +482,10 @@ fun SelectedAppInfoScreen(
                     version != null -> version
                     else -> stringResource(R.string.selected_app_meta_any_version)
                 }
-                Text(
-                    versionLabel,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.bodyMedium,
+                AppVersion(
+                    appInfo = vm.selectedAppInfo,
+                    versionName = versionLabel,
+                    style = MaterialTheme.typography.bodyMedium
                 )
             }
 
@@ -451,14 +517,25 @@ fun SelectedAppInfoScreen(
                     var versionIsExperimental = false
                     val versionLabel = when {
                         overrideVersion != null ->
-                            stringResource(R.string.version_label, overrideVersion).also {
+                            suggestedVersionLabel(
+                                versionName = overrideVersion,
+                                versionCodes = selectedDetail.versionCodesFor(overrideVersion),
+                                displayVersion = stringResource(R.string.version_label, overrideVersion)
+                            ).also {
                                 versionIsExperimental = selectedDetail.otherSupportedVersions
                                     .firstOrNull { info -> info.version == overrideVersion }
                                     ?.experimental == true
                             }
 
                         selectedDetail.recommendedVersion != null ->
-                            stringResource(R.string.version_label, selectedDetail.recommendedVersion).also {
+                            suggestedVersionLabel(
+                                versionName = selectedDetail.recommendedVersion,
+                                versionCodes = selectedDetail.recommendedVersionCodes,
+                                displayVersion = stringResource(
+                                    R.string.version_label,
+                                    selectedDetail.recommendedVersion
+                                )
+                            ).also {
                                 versionIsExperimental = selectedDetail.recommendedVersionExperimental
                             }
 
@@ -468,9 +545,13 @@ fun SelectedAppInfoScreen(
                         selectedDetail.otherSupportedVersions.isNotEmpty() -> {
                             val firstVersion = selectedDetail.otherSupportedVersions.first()
                             versionIsExperimental = firstVersion.experimental
-                            stringResource(
-                                R.string.version_label,
-                                firstVersion.version
+                            suggestedVersionLabel(
+                                versionName = firstVersion.version,
+                                versionCodes = firstVersion.versionCodes,
+                                displayVersion = stringResource(
+                                    R.string.version_label,
+                                    firstVersion.version
+                                )
                             )
                         }
 
@@ -564,6 +645,7 @@ fun SelectedAppInfoScreen(
 
     if (showBundleRecommendationDialog && bundleRecommendationDetails.isNotEmpty()) {
         BundleVersionSelectionDialog(
+            appInfo = vm.selectedAppInfo,
             details = bundleRecommendationDetails,
             selectedUid = selectedBundleUid,
             selectedOverride = selectedBundleOverride,
@@ -618,8 +700,16 @@ fun SelectedAppInfoScreen(
     }
 }
 
+private fun BundleRecommendationDetail.versionCodesFor(version: String): Set<Long> =
+    if (recommendedVersion == version) {
+        recommendedVersionCodes
+    } else {
+        otherSupportedVersions.firstOrNull { it.version == version }?.versionCodes.orEmpty()
+    }
+
 @Composable
 private fun BundleVersionSelectionDialog(
+    appInfo: PackageInfo?,
     details: List<BundleRecommendationDetail>,
     selectedUid: Int?,
     selectedOverride: String?,
@@ -683,6 +773,7 @@ private fun BundleVersionSelectionDialog(
                 ) { detail ->
                     val isSelectedBundle = selectedUid == detail.bundleUid
                     BundleRecommendationCard(
+                        appInfo = appInfo,
                         detail = detail,
                         isActive = isSelectedBundle,
                         selectedOverride = if (isSelectedBundle) selectedOverride else null,
@@ -704,6 +795,7 @@ private fun BundleVersionSelectionDialog(
     val targetDetail = if (recommendationsEnabled) otherVersionsTarget else null
     if (targetDetail != null) {
         OtherSupportedVersionsSelectionDialog(
+            appInfo = appInfo,
             detail = targetDetail,
             selectedOverride = if (selectedUid == targetDetail.bundleUid) selectedOverride else null,
             onSelect = { version ->
@@ -718,6 +810,7 @@ private fun BundleVersionSelectionDialog(
 
 @Composable
 private fun BundleRecommendationCard(
+    appInfo: PackageInfo?,
     detail: BundleRecommendationDetail,
     isActive: Boolean,
     selectedOverride: String?,
@@ -776,7 +869,14 @@ private fun BundleRecommendationCard(
 
             val recommendedLabel = when {
                 detail.recommendedVersion != null ->
-                    stringResource(R.string.version_label, detail.recommendedVersion)
+                    suggestedVersionLabel(
+                        versionName = detail.recommendedVersion,
+                        versionCodes = detail.recommendedVersionCodes,
+                        displayVersion = stringResource(
+                            R.string.version_label,
+                            detail.recommendedVersion
+                        )
+                    )
                 detail.supportsAllVersions ->
                     stringResource(R.string.bundle_version_all_versions)
                 else -> stringResource(R.string.bundle_version_no_version)
@@ -809,7 +909,14 @@ private fun BundleRecommendationCard(
                     SelectionBadge(
                         text = stringResource(
                             R.string.bundle_version_dialog_selected_override,
-                            stringResource(R.string.version_label, selectedOverride)
+                            suggestedVersionLabel(
+                                versionName = selectedOverride,
+                                versionCodes = detail.versionCodesFor(selectedOverride),
+                                displayVersion = stringResource(
+                                    R.string.version_label,
+                                    selectedOverride
+                                )
+                            )
                         ),
                         containerColor = MaterialTheme.colorScheme.primaryContainer,
                         contentColor = MaterialTheme.colorScheme.onPrimaryContainer
@@ -848,6 +955,7 @@ private fun BundleRecommendationCard(
 
 @Composable
 private fun OtherSupportedVersionsSelectionDialog(
+    appInfo: PackageInfo?,
     detail: BundleRecommendationDetail,
     selectedOverride: String?,
     onSelect: (String?) -> Unit,
@@ -880,7 +988,14 @@ private fun OtherSupportedVersionsSelectionDialog(
                                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                                 ) {
                                     row.forEach { info ->
-                                        val label = context.getString(R.string.version_label, info.version)
+                                        val label = suggestedVersionLabel(
+                                            versionName = info.version,
+                                            versionCodes = info.versionCodes,
+                                            displayVersion = context.getString(
+                                                R.string.version_label,
+                                                info.version
+                                            )
+                                        )
                                         FilterChip(
                                             selected = selectedOverride == info.version,
                                             onClick = { onSelect(info.version) },
@@ -893,11 +1008,9 @@ private fun OtherSupportedVersionsSelectionDialog(
                                                     verticalArrangement = Arrangement.spacedBy(3.dp),
                                                     modifier = Modifier.fillMaxWidth()
                                                 ) {
-                                                    Text(
+                                                    ExpandableText(
                                                         text = label,
-                                                        textAlign = TextAlign.Center,
-                                                        maxLines = 1,
-                                                        overflow = TextOverflow.Ellipsis
+                                                        textAlign = TextAlign.Center
                                                     )
                                                     if (info.experimental) {
                                                         ExperimentalVersionBadge()
@@ -1016,12 +1129,10 @@ private fun SelectionBadge(
         tonalElevation = 0.dp,
         shadowElevation = 0.dp
     ) {
-        Text(
+        ExpandableText(
             text = text,
             style = MaterialTheme.typography.labelMedium,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            softWrap = false,
+            collapsedSoftWrap = false,
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
         )
     }
